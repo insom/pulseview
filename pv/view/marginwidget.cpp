@@ -18,17 +18,60 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#include "view.h"
+#include <QMenu>
+#include <QMouseEvent>
 
-#include "marginwidget.h"
+#include "view.hpp"
+
+#include "marginwidget.hpp"
+
+#include <pv/widgets/popup.hpp>
+
+using std::shared_ptr;
 
 namespace pv {
 namespace view {
 
 MarginWidget::MarginWidget(View &parent) :
-	QWidget(&parent),
-	_view(parent)
+	ViewWidget(parent)
 {
+	setAttribute(Qt::WA_NoSystemBackground, true);
+}
+
+void MarginWidget::item_clicked(const shared_ptr<ViewItem> &item)
+{
+	if (item && item->enabled())
+		show_popup(item);
+}
+
+void MarginWidget::show_popup(const shared_ptr<ViewItem> &item)
+{
+	pv::widgets::Popup *const p = item->create_popup(this);
+	if (p)
+		p->show();
+}
+
+void MarginWidget::contextMenuEvent(QContextMenuEvent *event)
+{
+	const shared_ptr<ViewItem> r = get_mouse_over_item(mouse_point_);
+	if (!r)
+		return;
+
+	QMenu *menu = r->create_context_menu(this);
+	if (menu)
+		menu->exec(event->globalPos());
+}
+
+void MarginWidget::keyPressEvent(QKeyEvent *e)
+{
+	assert(e);
+
+	if (e->key() == Qt::Key_Delete) {
+		const auto items = this->items();
+		for (auto &i : items)
+			if (i->selected())
+				i->delete_pressed();
+	}
 }
 
 } // namespace view

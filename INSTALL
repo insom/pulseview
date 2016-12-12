@@ -5,21 +5,27 @@ INSTALL
 Requirements
 ------------
 
- - git
- - g++
+ - git (only needed when building from git)
+ - A C++ compiler with C++11 support (-std=c++11 option), e.g.
+   - g++ (>= 4.7)
+   - clang++ (>= 3.1)
  - make
- - libtool
+ - libtool (only needed when building from git)
  - pkg-config >= 0.22
  - cmake >= 2.8.6
  - libglib >= 2.28.0
- - Qt >= 4.5
- - libboost >= 1.42 (including the following libs):
+ - glibmm-2.4 (>= 2.28.0)
+ - Qt4 >= 4.5 or Qt5 (including the following components):
+    - Qt4: QtCore, QtGui, QtSvg
+    - Qt5: Qt5Core, Qt5Gui, Qt5Widgets, Qt5Svg
+ - libboost >= 1.53 (including the following libs):
     - libboost-system
-    - libboost-thread
     - libboost-filesystem
+    - libboost-thread
     - libboost-test (optional, only needed to run the unit tests)
- - libsigrok >= 0.3.0
- - libsigrokdecode >= 0.3.0
+ - libsigrokcxx >= 0.4.0 (libsigrok C++ bindings)
+ - libsigrokdecode >= 0.4.0
+ - libsigrokandroidutils >= 0.1.0 (optional, only needed on Android)
 
 
 Building and installing

@@ -18,227 +18,508 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
+#include <cassert>
+
 #ifdef ENABLE_DECODE
 #include <libsigrokdecode/libsigrokdecode.h>
 #endif
 
-#include <boost/bind.hpp>
-#include <boost/foreach.hpp>
-
 #include <algorithm>
 #include <iterator>
+
+#include <boost/algorithm/string/join.hpp>
 
 #include <QAction>
 #include <QApplication>
 #include <QButtonGroup>
+#include <QCloseEvent>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QMenu>
 #include <QMenuBar>
+#include <QSettings>
 #include <QStatusBar>
 #include <QVBoxLayout>
 #include <QWidget>
 
-#include "mainwindow.h"
+#include "mainwindow.hpp"
 
-#include "devicemanager.h"
-#include "device/device.h"
-#include "dialogs/about.h"
-#include "dialogs/connect.h"
-#include "dialogs/storeprogress.h"
-#include "toolbars/samplingbar.h"
-#include "view/logicsignal.h"
-#include "view/view.h"
+#include "devicemanager.hpp"
+#include "util.hpp"
+#include "data/segment.hpp"
+#include "devices/hardwaredevice.hpp"
+#include "devices/inputfile.hpp"
+#include "devices/sessionfile.hpp"
+#include "dialogs/about.hpp"
+#include "dialogs/connect.hpp"
+#include "dialogs/inputoutputoptions.hpp"
+#include "dialogs/storeprogress.hpp"
+#include "toolbars/mainbar.hpp"
+#include "view/logicsignal.hpp"
+#include "view/view.hpp"
+#include "widgets/exportmenu.hpp"
+#include "widgets/importmenu.hpp"
 #ifdef ENABLE_DECODE
-#include "widgets/decodermenu.h"
+#include "widgets/decodermenu.hpp"
 #endif
+#include "widgets/hidingmenubar.hpp"
 
-/* __STDC_FORMAT_MACROS is required for PRIu64 and friends (in C++). */
-#define __STDC_FORMAT_MACROS
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <glib.h>
-#include <libsigrok/libsigrok.h>
+#include <libsigrokcxx/libsigrokcxx.hpp>
 
-using boost::shared_ptr;
+using std::cerr;
+using std::endl;
 using std::list;
+using std::map;
+using std::pair;
+using std::shared_ptr;
+using std::string;
+using std::vector;
+
+using boost::algorithm::join;
+
+using sigrok::Error;
+using sigrok::OutputFormat;
+using sigrok::InputFormat;
 
 namespace pv {
 
 namespace view {
-class SelectableItem;
+class ViewItem;
 }
 
+const char *MainWindow::SettingOpenDirectory = "MainWindow/OpenDirectory";
+const char *MainWindow::SettingSaveDirectory = "MainWindow/SaveDirectory";
+
 MainWindow::MainWindow(DeviceManager &device_manager,
-	const char *open_file_name,
+	string open_file_name, string open_file_format,
 	QWidget *parent) :
 	QMainWindow(parent),
-	_device_manager(device_manager),
-	_session(device_manager)
+	device_manager_(device_manager),
+	session_(device_manager),
+	action_open_(new QAction(this)),
+	action_save_as_(new QAction(this)),
+	action_save_selection_as_(new QAction(this)),
+	action_connect_(new QAction(this)),
+	action_quit_(new QAction(this)),
+	action_view_zoom_in_(new QAction(this)),
+	action_view_zoom_out_(new QAction(this)),
+	action_view_zoom_fit_(new QAction(this)),
+	action_view_zoom_one_to_one_(new QAction(this)),
+	action_view_sticky_scrolling_(new QAction(this)),
+	action_view_coloured_bg_(new QAction(this)),
+	action_view_show_cursors_(new QAction(this)),
+	action_about_(new QAction(this))
+#ifdef ENABLE_DECODE
+	, menu_decoders_add_(new pv::widgets::DecoderMenu(this, true))
+#endif
 {
+	qRegisterMetaType<util::Timestamp>("util::Timestamp");
+
 	setup_ui();
-	if (open_file_name) {
-		const QString s(QString::fromUtf8(open_file_name));
-		QMetaObject::invokeMethod(this, "load_file",
-			Qt::QueuedConnection,
-			Q_ARG(QString, s));
+	restore_ui_settings();
+	if (open_file_name.empty())
+		select_init_device();
+	else
+		load_init_file(open_file_name, open_file_format);
+}
+
+QAction* MainWindow::action_open() const
+{
+	return action_open_;
+}
+
+QAction* MainWindow::action_save_as() const
+{
+	return action_save_as_;
+}
+
+QAction* MainWindow::action_save_selection_as() const
+{
+	return action_save_selection_as_;
+}
+
+QAction* MainWindow::action_connect() const
+{
+	return action_connect_;
+}
+
+QAction* MainWindow::action_quit() const
+{
+	return action_quit_;
+}
+
+QAction* MainWindow::action_view_zoom_in() const
+{
+	return action_view_zoom_in_;
+}
+
+QAction* MainWindow::action_view_zoom_out() const
+{
+	return action_view_zoom_out_;
+}
+
+QAction* MainWindow::action_view_zoom_fit() const
+{
+	return action_view_zoom_fit_;
+}
+
+QAction* MainWindow::action_view_zoom_one_to_one() const
+{
+	return action_view_zoom_one_to_one_;
+}
+
+QAction* MainWindow::action_view_sticky_scrolling() const
+{
+	return action_view_sticky_scrolling_;
+}
+
+QAction* MainWindow::action_view_coloured_bg() const
+{
+	return action_view_coloured_bg_;
+}
+
+QAction* MainWindow::action_view_show_cursors() const
+{
+	return action_view_show_cursors_;
+}
+
+QAction* MainWindow::action_about() const
+{
+	return action_about_;
+}
+
+#ifdef ENABLE_DECODE
+QMenu* MainWindow::menu_decoder_add() const
+{
+	return menu_decoders_add_;
+}
+#endif
+
+void MainWindow::run_stop()
+{
+	switch (session_.get_capture_state()) {
+	case Session::Stopped:
+		session_.start_capture([&](QString message) {
+			session_error("Capture failed", message); });
+		break;
+	case Session::AwaitingTrigger:
+	case Session::Running:
+		session_.stop_capture();
+		break;
 	}
+}
+
+void MainWindow::select_device(shared_ptr<devices::Device> device)
+{
+	try {
+		if (device)
+			session_.set_device(device);
+		else
+			session_.set_default_device();
+	} catch (const QString &e) {
+		QMessageBox msg(this);
+		msg.setText(e);
+		msg.setInformativeText(tr("Failed to Select Device"));
+		msg.setStandardButtons(QMessageBox::Ok);
+		msg.setIcon(QMessageBox::Warning);
+		msg.exec();
+	}
+}
+
+void MainWindow::export_file(shared_ptr<OutputFormat> format,
+	bool selection_only)
+{
+	using pv::dialogs::StoreProgress;
+
+	// Stop any currently running capture session
+	session_.stop_capture();
+
+	QSettings settings;
+	const QString dir = settings.value(SettingSaveDirectory).toString();
+
+	std::pair<uint64_t, uint64_t> sample_range;
+
+	// Selection only? Verify that the cursors are active and fetch their values
+	if (selection_only) {
+		if (!view_->cursors()->enabled()) {
+			show_session_error(tr("Missing Cursors"), tr("You need to set the " \
+					"cursors before you can save the data enclosed by them " \
+					"to a session file (e.g. using ALT-V - Show Cursors)."));
+			return;
+		}
+
+		const double samplerate = session_.get_samplerate();
+
+		const pv::util::Timestamp& start_time = view_->cursors()->first()->time();
+		const pv::util::Timestamp& end_time = view_->cursors()->second()->time();
+
+		const uint64_t start_sample = start_time.convert_to<double>() * samplerate;
+		const uint64_t end_sample = end_time.convert_to<double>() * samplerate;
+
+		sample_range = std::make_pair(start_sample, end_sample);
+	} else {
+		sample_range = std::make_pair(0, 0);
+	}
+
+	// Construct the filter
+	const vector<string> exts = format->extensions();
+	QString filter = tr("%1 files ").arg(
+		QString::fromStdString(format->description()));
+
+	if (exts.empty())
+		filter += "(*.*)";
+	else
+		filter += QString("(*.%1);;%2 (*.*)").arg(
+			QString::fromStdString(join(exts, ", *."))).arg(
+			tr("All Files"));
+
+	// Show the file dialog
+	const QString file_name = QFileDialog::getSaveFileName(
+		this, tr("Save File"), dir, filter);
+
+	if (file_name.isEmpty())
+		return;
+
+	const QString abs_path = QFileInfo(file_name).absolutePath();
+	settings.setValue(SettingSaveDirectory, abs_path);
+
+	// Show the options dialog
+	map<string, Glib::VariantBase> options;
+	if (!format->options().empty()) {
+		dialogs::InputOutputOptions dlg(
+			tr("Export %1").arg(QString::fromStdString(
+				format->description())),
+			format->options(), this);
+		if (!dlg.exec())
+			return;
+		options = dlg.options();
+	}
+
+	StoreProgress *dlg = new StoreProgress(file_name, format, options,
+		sample_range, session_, this);
+	dlg->run();
+}
+
+void MainWindow::import_file(shared_ptr<InputFormat> format)
+{
+	assert(format);
+
+	QSettings settings;
+	const QString dir = settings.value(SettingOpenDirectory).toString();
+
+	// Construct the filter
+	const vector<string> exts = format->extensions();
+	const QString filter = exts.empty() ? "" :
+		tr("%1 files (*.%2)").arg(
+			QString::fromStdString(format->description())).arg(
+			QString::fromStdString(join(exts, ", *.")));
+
+	// Show the file dialog
+	const QString file_name = QFileDialog::getOpenFileName(
+		this, tr("Import File"), dir, tr(
+			"%1 files (*.*);;All Files (*.*)").arg(
+			QString::fromStdString(format->description())));
+
+	if (file_name.isEmpty())
+		return;
+
+	// Show the options dialog
+	map<string, Glib::VariantBase> options;
+	if (!format->options().empty()) {
+		dialogs::InputOutputOptions dlg(
+			tr("Import %1").arg(QString::fromStdString(
+				format->description())),
+			format->options(), this);
+		if (!dlg.exec())
+			return;
+		options = dlg.options();
+	}
+
+	load_file(file_name, format, options);
+
+	const QString abs_path = QFileInfo(file_name).absolutePath();
+	settings.setValue(SettingOpenDirectory, abs_path);
 }
 
 void MainWindow::setup_ui()
 {
 	setObjectName(QString::fromUtf8("MainWindow"));
 
-	resize(1024, 768);
-
 	// Set the window icon
 	QIcon icon;
-	icon.addFile(QString::fromUtf8(":/icons/sigrok-logo-notext.png"),
-		QSize(), QIcon::Normal, QIcon::Off);
+	icon.addFile(QString(":/icons/sigrok-logo-notext.svg"));
 	setWindowIcon(icon);
 
 	// Setup the central widget
-	_central_widget = new QWidget(this);
-	_vertical_layout = new QVBoxLayout(_central_widget);
-	_vertical_layout->setSpacing(6);
-	_vertical_layout->setContentsMargins(0, 0, 0, 0);
-	setCentralWidget(_central_widget);
+	central_widget_ = new QWidget(this);
+	vertical_layout_ = new QVBoxLayout(central_widget_);
+	vertical_layout_->setSpacing(6);
+	vertical_layout_->setContentsMargins(0, 0, 0, 0);
+	setCentralWidget(central_widget_);
 
-	_view = new pv::view::View(_session, this);
+	view_ = new pv::view::View(session_, this);
 
-	_vertical_layout->addWidget(_view);
+	vertical_layout_->addWidget(view_);
 
 	// Setup the menu bar
-	QMenuBar *const menu_bar = new QMenuBar(this);
-	menu_bar->setGeometry(QRect(0, 0, 400, 25));
+	pv::widgets::HidingMenuBar *const menu_bar =
+		new pv::widgets::HidingMenuBar(this);
 
 	// File Menu
 	QMenu *const menu_file = new QMenu;
-	menu_file->setTitle(QApplication::translate(
-		"MainWindow", "&File", 0, QApplication::UnicodeUTF8));
+	menu_file->setTitle(tr("&File"));
 
-	QAction *const action_open = new QAction(this);
-	action_open->setText(QApplication::translate(
-		"MainWindow", "&Open...", 0, QApplication::UnicodeUTF8));
-	action_open->setIcon(QIcon::fromTheme("document-open",
+	action_open_->setText(tr("&Open..."));
+	action_open_->setIcon(QIcon::fromTheme("document-open",
 		QIcon(":/icons/document-open.png")));
-	action_open->setObjectName(QString::fromUtf8("actionOpen"));
-	menu_file->addAction(action_open);
+	action_open_->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_O));
+	action_open_->setObjectName(QString::fromUtf8("actionOpen"));
+	menu_file->addAction(action_open_);
 
-	QAction *const action_save_as = new QAction(this);
-	action_save_as->setText(QApplication::translate(
-		"MainWindow", "&Save As...", 0, QApplication::UnicodeUTF8));
-	action_save_as->setIcon(QIcon::fromTheme("document-save-as",
+	action_save_as_->setText(tr("&Save As..."));
+	action_save_as_->setIcon(QIcon::fromTheme("document-save-as",
 		QIcon(":/icons/document-save-as.png")));
-	action_save_as->setObjectName(QString::fromUtf8("actionSaveAs"));
-	menu_file->addAction(action_save_as);
+	action_save_as_->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_S));
+	action_save_as_->setObjectName(QString::fromUtf8("actionSaveAs"));
+	menu_file->addAction(action_save_as_);
+
+	action_save_selection_as_->setText(tr("Save Selected &Range As..."));
+	action_save_selection_as_->setIcon(QIcon::fromTheme("document-save-as",
+		QIcon(":/icons/document-save-as.png")));
+	action_save_selection_as_->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_R));
+	action_save_selection_as_->setObjectName(QString::fromUtf8("actionSaveSelectionAs"));
+	menu_file->addAction(action_save_selection_as_);
 
 	menu_file->addSeparator();
 
-	QAction *const action_connect = new QAction(this);
-	action_connect->setText(QApplication::translate(
-		"MainWindow", "&Connect to Device...", 0,
-		QApplication::UnicodeUTF8));
-	action_connect->setObjectName(QString::fromUtf8("actionConnect"));
-	menu_file->addAction(action_connect);
+	widgets::ExportMenu *menu_file_export = new widgets::ExportMenu(this,
+		device_manager_.context());
+	menu_file_export->setTitle(tr("&Export"));
+	connect(menu_file_export,
+		SIGNAL(format_selected(std::shared_ptr<sigrok::OutputFormat>)),
+		this, SLOT(export_file(std::shared_ptr<sigrok::OutputFormat>)));
+	menu_file->addAction(menu_file_export->menuAction());
+
+	widgets::ImportMenu *menu_file_import = new widgets::ImportMenu(this,
+		device_manager_.context());
+	menu_file_import->setTitle(tr("&Import"));
+	connect(menu_file_import,
+		SIGNAL(format_selected(std::shared_ptr<sigrok::InputFormat>)),
+		this, SLOT(import_file(std::shared_ptr<sigrok::InputFormat>)));
+	menu_file->addAction(menu_file_import->menuAction());
 
 	menu_file->addSeparator();
 
-	QAction *action_quit = new QAction(this);
-	action_quit->setText(QApplication::translate(
-		"MainWindow", "&Quit", 0, QApplication::UnicodeUTF8));
-	action_quit->setIcon(QIcon::fromTheme("application-exit",
+	action_connect_->setText(tr("&Connect to Device..."));
+	action_connect_->setObjectName(QString::fromUtf8("actionConnect"));
+	menu_file->addAction(action_connect_);
+
+	menu_file->addSeparator();
+
+	action_quit_->setText(tr("&Quit"));
+	action_quit_->setIcon(QIcon::fromTheme("application-exit",
 		QIcon(":/icons/application-exit.png")));
-	action_quit->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_Q));
-	action_quit->setObjectName(QString::fromUtf8("actionQuit"));
-	menu_file->addAction(action_quit);
+	action_quit_->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_Q));
+	action_quit_->setObjectName(QString::fromUtf8("actionQuit"));
+	menu_file->addAction(action_quit_);
 
 	// View Menu
 	QMenu *menu_view = new QMenu;
-	menu_view->setTitle(QApplication::translate(
-		"MainWindow", "&View", 0, QApplication::UnicodeUTF8));
+	menu_view->setTitle(tr("&View"));
 
-	QAction *const action_view_zoom_in = new QAction(this);
-	action_view_zoom_in->setText(QApplication::translate(
-		"MainWindow", "Zoom &In", 0, QApplication::UnicodeUTF8));
-	action_view_zoom_in->setIcon(QIcon::fromTheme("zoom-in",
+	action_view_zoom_in_->setText(tr("Zoom &In"));
+	action_view_zoom_in_->setIcon(QIcon::fromTheme("zoom-in",
 		QIcon(":/icons/zoom-in.png")));
 	// simply using Qt::Key_Plus shows no + in the menu
-	action_view_zoom_in->setShortcut(QKeySequence::ZoomIn);
-	action_view_zoom_in->setObjectName(
+	action_view_zoom_in_->setShortcut(QKeySequence::ZoomIn);
+	action_view_zoom_in_->setObjectName(
 		QString::fromUtf8("actionViewZoomIn"));
-	menu_view->addAction(action_view_zoom_in);
+	menu_view->addAction(action_view_zoom_in_);
 
-	QAction *const action_view_zoom_out = new QAction(this);
-	action_view_zoom_out->setText(QApplication::translate(
-		"MainWindow", "Zoom &Out", 0, QApplication::UnicodeUTF8));
-	action_view_zoom_out->setIcon(QIcon::fromTheme("zoom-out",
+	action_view_zoom_out_->setText(tr("Zoom &Out"));
+	action_view_zoom_out_->setIcon(QIcon::fromTheme("zoom-out",
 		QIcon(":/icons/zoom-out.png")));
-	action_view_zoom_out->setShortcut(QKeySequence::ZoomOut);
-	action_view_zoom_out->setObjectName(
+	action_view_zoom_out_->setShortcut(QKeySequence::ZoomOut);
+	action_view_zoom_out_->setObjectName(
 		QString::fromUtf8("actionViewZoomOut"));
-	menu_view->addAction(action_view_zoom_out);
+	menu_view->addAction(action_view_zoom_out_);
 
-	QAction *const action_view_zoom_fit = new QAction(this);
-	action_view_zoom_fit->setText(QApplication::translate(
-		"MainWindow", "Zoom to &Fit", 0, QApplication::UnicodeUTF8));
-	action_view_zoom_fit->setIcon(QIcon::fromTheme("zoom-fit",
+	action_view_zoom_fit_->setCheckable(true);
+	action_view_zoom_fit_->setText(tr("Zoom to &Fit"));
+	action_view_zoom_fit_->setIcon(QIcon::fromTheme("zoom-fit",
 		QIcon(":/icons/zoom-fit.png")));
-	action_view_zoom_fit->setShortcut(QKeySequence(Qt::Key_F));
-	action_view_zoom_fit->setObjectName(
+	action_view_zoom_fit_->setShortcut(QKeySequence(Qt::Key_F));
+	action_view_zoom_fit_->setObjectName(
 		QString::fromUtf8("actionViewZoomFit"));
-	menu_view->addAction(action_view_zoom_fit);
+	menu_view->addAction(action_view_zoom_fit_);
 
-	QAction *const action_view_zoom_one_to_one = new QAction(this);
-	action_view_zoom_one_to_one->setText(QApplication::translate(
-		"MainWindow", "Zoom to &One-to-One", 0,
-			QApplication::UnicodeUTF8));
-	action_view_zoom_one_to_one->setIcon(QIcon::fromTheme("zoom-original",
+	action_view_zoom_one_to_one_->setText(tr("Zoom to O&ne-to-One"));
+	action_view_zoom_one_to_one_->setIcon(QIcon::fromTheme("zoom-original",
 		QIcon(":/icons/zoom-original.png")));
-	action_view_zoom_one_to_one->setShortcut(QKeySequence(Qt::Key_O));
-	action_view_zoom_one_to_one->setObjectName(
+	action_view_zoom_one_to_one_->setShortcut(QKeySequence(Qt::Key_O));
+	action_view_zoom_one_to_one_->setObjectName(
 		QString::fromUtf8("actionViewZoomOneToOne"));
-	menu_view->addAction(action_view_zoom_one_to_one);
+	menu_view->addAction(action_view_zoom_one_to_one_);
 
 	menu_view->addSeparator();
 
-	QAction *action_view_show_cursors = new QAction(this);
-	action_view_show_cursors->setCheckable(true);
-	action_view_show_cursors->setChecked(_view->cursors_shown());
-	action_view_show_cursors->setShortcut(QKeySequence(Qt::Key_C));
-	action_view_show_cursors->setObjectName(
+	action_view_sticky_scrolling_->setCheckable(true);
+	action_view_sticky_scrolling_->setChecked(true);
+	action_view_sticky_scrolling_->setShortcut(QKeySequence(Qt::Key_S));
+	action_view_sticky_scrolling_->setObjectName(
+		QString::fromUtf8("actionViewStickyScrolling"));
+	action_view_sticky_scrolling_->setText(tr("&Sticky Scrolling"));
+	menu_view->addAction(action_view_sticky_scrolling_);
+
+	view_->enable_sticky_scrolling(action_view_sticky_scrolling_->isChecked());
+
+	menu_view->addSeparator();
+
+	action_view_coloured_bg_->setCheckable(true);
+	action_view_coloured_bg_->setChecked(true);
+	action_view_coloured_bg_->setShortcut(QKeySequence(Qt::Key_B));
+	action_view_coloured_bg_->setObjectName(
+		QString::fromUtf8("actionViewColouredBg"));
+	action_view_coloured_bg_->setText(tr("Use &coloured backgrounds"));
+	menu_view->addAction(action_view_coloured_bg_);
+
+	view_->enable_coloured_bg(action_view_coloured_bg_->isChecked());
+
+	menu_view->addSeparator();
+
+	action_view_show_cursors_->setCheckable(true);
+	action_view_show_cursors_->setChecked(view_->cursors_shown());
+	action_view_show_cursors_->setIcon(QIcon::fromTheme("show-cursors",
+		QIcon(":/icons/show-cursors.svg")));
+	action_view_show_cursors_->setShortcut(QKeySequence(Qt::Key_C));
+	action_view_show_cursors_->setObjectName(
 		QString::fromUtf8("actionViewShowCursors"));
-	action_view_show_cursors->setText(QApplication::translate(
-		"MainWindow", "Show &Cursors", 0, QApplication::UnicodeUTF8));
-	menu_view->addAction(action_view_show_cursors);
+	action_view_show_cursors_->setText(tr("Show &Cursors"));
+	menu_view->addAction(action_view_show_cursors_);
 
 	// Decoders Menu
 #ifdef ENABLE_DECODE
 	QMenu *const menu_decoders = new QMenu;
-	menu_decoders->setTitle(QApplication::translate(
-		"MainWindow", "&Decoders", 0, QApplication::UnicodeUTF8));
+	menu_decoders->setTitle(tr("&Decoders"));
 
-	pv::widgets::DecoderMenu *const menu_decoders_add =
-		new pv::widgets::DecoderMenu(menu_decoders, true);
-	menu_decoders_add->setTitle(QApplication::translate(
-		"MainWindow", "&Add", 0, QApplication::UnicodeUTF8));
-	connect(menu_decoders_add, SIGNAL(decoder_selected(srd_decoder*)),
+	menu_decoders_add_->setTitle(tr("&Add"));
+	connect(menu_decoders_add_, SIGNAL(decoder_selected(srd_decoder*)),
 		this, SLOT(add_decoder(srd_decoder*)));
 
-	menu_decoders->addMenu(menu_decoders_add);
+	menu_decoders->addMenu(menu_decoders_add_);
 #endif
 
 	// Help Menu
 	QMenu *const menu_help = new QMenu;
-	menu_help->setTitle(QApplication::translate(
-		"MainWindow", "&Help", 0, QApplication::UnicodeUTF8));
+	menu_help->setTitle(tr("&Help"));
 
-	QAction *const action_about = new QAction(this);
-	action_about->setObjectName(QString::fromUtf8("actionAbout"));
-	action_about->setText(QApplication::translate(
-		"MainWindow", "&About...", 0, QApplication::UnicodeUTF8));
-	menu_help->addAction(action_about);
+	action_about_->setObjectName(QString::fromUtf8("actionAbout"));
+	action_about_->setText(tr("&About..."));
+	menu_help->addAction(action_about_);
 
 	menu_bar->addAction(menu_file->menuAction());
 	menu_bar->addAction(menu_view->menuAction());
@@ -250,33 +531,140 @@ void MainWindow::setup_ui()
 	setMenuBar(menu_bar);
 	QMetaObject::connectSlotsByName(this);
 
-	// Setup the toolbar
-	QToolBar *const toolbar = new QToolBar(tr("Main Toolbar"), this);
-	toolbar->addAction(action_open);
-	toolbar->addSeparator();
-	toolbar->addAction(action_view_zoom_in);
-	toolbar->addAction(action_view_zoom_out);
-	toolbar->addAction(action_view_zoom_fit);
-	addToolBar(toolbar);
+	// Also add all actions to the main window for always-enabled hotkeys
+	for (QAction* action : menu_bar->actions())
+		this->addAction(action);
 
-	// Setup the sampling bar
-	_sampling_bar = new toolbars::SamplingBar(_session, this);
+	// Setup the toolbar
+	main_bar_ = new toolbars::MainBar(session_, *this);
 
 	// Populate the device list and select the initially selected device
 	update_device_list();
 
-	connect(_sampling_bar, SIGNAL(run_stop()), this,
-		SLOT(run_stop()));
-	addToolBar(_sampling_bar);
+	addToolBar(main_bar_);
 
 	// Set the title
-	setWindowTitle(QApplication::translate("MainWindow", "PulseView", 0,
-		QApplication::UnicodeUTF8));
+	setWindowTitle(tr("PulseView"));
 
-	// Setup _session events
-	connect(&_session, SIGNAL(capture_state_changed(int)), this,
+	// Setup session_ events
+	connect(&session_, SIGNAL(capture_state_changed(int)), this,
 		SLOT(capture_state_changed(int)));
+	connect(&session_, SIGNAL(device_selected()), this,
+		SLOT(device_selected()));
+	connect(&session_, SIGNAL(trigger_event(util::Timestamp)), view_,
+		SLOT(trigger_event(util::Timestamp)));
 
+	// Setup view_ events
+	connect(view_, SIGNAL(sticky_scrolling_changed(bool)), this,
+		SLOT(sticky_scrolling_changed(bool)));
+	connect(view_, SIGNAL(always_zoom_to_fit_changed(bool)), this,
+		SLOT(always_zoom_to_fit_changed(bool)));
+
+}
+
+void MainWindow::select_init_device()
+{
+	QSettings settings;
+	map<string, string> dev_info;
+	list<string> key_list;
+
+	// Re-select last used device if possible.
+	settings.beginGroup("Device");
+	key_list.push_back("vendor");
+	key_list.push_back("model");
+	key_list.push_back("version");
+	key_list.push_back("serial_num");
+	key_list.push_back("connection_id");
+
+	for (string key : key_list) {
+		const QString k = QString::fromStdString(key);
+		if (!settings.contains(k))
+			continue;
+
+		const string value = settings.value(k).toString().toStdString();
+		if (!value.empty())
+			dev_info.insert(std::make_pair(key, value));
+	}
+
+	const shared_ptr<devices::HardwareDevice> device =
+		device_manager_.find_device_from_info(dev_info);
+	select_device(device);
+	update_device_list();
+
+	settings.endGroup();
+}
+
+void MainWindow::load_init_file(const std::string &file_name,
+	const std::string &format)
+{
+	shared_ptr<InputFormat> input_format;
+
+	if (!format.empty()) {
+		const map<string, shared_ptr<InputFormat> > formats =
+			device_manager_.context()->input_formats();
+		const auto iter = find_if(formats.begin(), formats.end(),
+			[&](const pair<string, shared_ptr<InputFormat> > f) {
+				return f.first == format; });
+		if (iter == formats.end()) {
+			cerr << "Unexpected input format: " << format << endl;
+			return;
+		}
+
+		input_format = (*iter).second;
+	}
+
+	load_file(QString::fromStdString(file_name), input_format);
+}
+
+
+void MainWindow::save_ui_settings()
+{
+	QSettings settings;
+
+	map<string, string> dev_info;
+	list<string> key_list;
+
+	settings.beginGroup("MainWindow");
+	settings.setValue("state", saveState());
+	settings.setValue("geometry", saveGeometry());
+	settings.endGroup();
+
+	if (session_.device()) {
+		settings.beginGroup("Device");
+		key_list.push_back("vendor");
+		key_list.push_back("model");
+		key_list.push_back("version");
+		key_list.push_back("serial_num");
+		key_list.push_back("connection_id");
+
+		dev_info = device_manager_.get_device_info(
+			session_.device());
+
+		for (string key : key_list) {
+			if (dev_info.count(key))
+				settings.setValue(QString::fromUtf8(key.c_str()),
+						QString::fromUtf8(dev_info.at(key).c_str()));
+			else
+				settings.remove(QString::fromUtf8(key.c_str()));
+		}
+
+		settings.endGroup();
+	}
+}
+
+void MainWindow::restore_ui_settings()
+{
+	QSettings settings;
+
+	settings.beginGroup("MainWindow");
+
+	if (settings.contains("geometry")) {
+		restoreGeometry(settings.value("geometry").toByteArray());
+		restoreState(settings.value("state").toByteArray());
+	} else
+		resize(1000, 720);
+
+	settings.endGroup();
 }
 
 void MainWindow::session_error(
@@ -289,40 +677,54 @@ void MainWindow::session_error(
 
 void MainWindow::update_device_list()
 {
-	assert(_sampling_bar);
-
-	shared_ptr<pv::device::DevInst> selected_device = _session.get_device();
-	list< shared_ptr<device::DevInst> > devices;
-	std::copy(_device_manager.devices().begin(),
-		_device_manager.devices().end(), std::back_inserter(devices));
-
-	if (std::find(devices.begin(), devices.end(), selected_device) ==
-		devices.end())
-		devices.push_back(selected_device);
-	assert(selected_device);
-
-	_sampling_bar->set_device_list(devices, selected_device);
+	main_bar_->update_device_list();
 }
 
-void MainWindow::load_file(QString file_name)
+void MainWindow::load_file(QString file_name,
+	std::shared_ptr<sigrok::InputFormat> format,
+	const std::map<std::string, Glib::VariantBase> &options)
 {
 	const QString errorMessage(
 		QString("Failed to load file %1").arg(file_name));
-	const QString infoMessage;
 
 	try {
-		_session.set_file(file_name.toStdString());
-	} catch(QString e) {
-		show_session_error(tr("Failed to load ") + file_name, e);
-		_session.set_default_device();
+		if (format)
+			session_.set_device(shared_ptr<devices::Device>(
+				new devices::InputFile(
+					device_manager_.context(),
+					file_name.toStdString(),
+					format, options)));
+		else
+			session_.set_device(shared_ptr<devices::Device>(
+				new devices::SessionFile(
+					device_manager_.context(),
+					file_name.toStdString())));
+	} catch (Error e) {
+		show_session_error(tr("Failed to load ") + file_name, e.what());
+		session_.set_default_device();
 		update_device_list();
 		return;
 	}
 
 	update_device_list();
 
-	_session.start_capture(boost::bind(&MainWindow::session_error, this,
-		errorMessage, infoMessage));
+	session_.start_capture([&, errorMessage](QString infoMessage) {
+		session_error(errorMessage, infoMessage); });
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+	save_ui_settings();
+	event->accept();
+}
+
+void MainWindow::keyReleaseEvent(QKeyEvent *event)
+{
+	if (event->key() == Qt::Key_Alt) {
+		menuBar()->setHidden(!menuBar()->isHidden());
+		menuBar()->setFocus();
+	}
+	QMainWindow::keyReleaseEvent(event);
 }
 
 void MainWindow::show_session_error(
@@ -338,44 +740,44 @@ void MainWindow::show_session_error(
 
 void MainWindow::on_actionOpen_triggered()
 {
+	QSettings settings;
+	const QString dir = settings.value(SettingOpenDirectory).toString();
+
 	// Show the dialog
 	const QString file_name = QFileDialog::getOpenFileName(
-		this, tr("Open File"), "", tr(
+		this, tr("Open File"), dir, tr(
 			"Sigrok Sessions (*.sr);;"
 			"All Files (*.*)"));
-	if (!file_name.isEmpty())
+
+	if (!file_name.isEmpty()) {
 		load_file(file_name);
+
+		const QString abs_path = QFileInfo(file_name).absolutePath();
+		settings.setValue(SettingOpenDirectory, abs_path);
+	}
 }
 
 void MainWindow::on_actionSaveAs_triggered()
 {
-	using pv::dialogs::StoreProgress;
+	export_file(device_manager_.context()->output_formats()["srzip"]);
+}
 
-	// Stop any currently running capture session
-	_session.stop_capture();
-
-	// Show the dialog
-	const QString file_name = QFileDialog::getSaveFileName(
-		this, tr("Save File"), "", tr("Sigrok Sessions (*.sr)"));
-
-	if (file_name.isEmpty())
-		return;
-
-	StoreProgress *dlg = new StoreProgress(file_name, _session, this);
-	dlg->run();
+void MainWindow::on_actionSaveSelectionAs_triggered()
+{
+	export_file(device_manager_.context()->output_formats()["srzip"], true);
 }
 
 void MainWindow::on_actionConnect_triggered()
 {
 	// Stop any currently running capture session
-	_session.stop_capture();
+	session_.stop_capture();
 
-	dialogs::Connect dlg(this, _device_manager);
+	dialogs::Connect dlg(this, device_manager_);
 
 	// If the user selected a device, select it in the device list. Select the
 	// current device otherwise.
 	if (dlg.exec())
-		_session.set_device(dlg.get_selected_device());
+		select_device(dlg.get_selected_device());
 
 	update_device_list();
 }
@@ -387,70 +789,85 @@ void MainWindow::on_actionQuit_triggered()
 
 void MainWindow::on_actionViewZoomIn_triggered()
 {
-	_view->zoom(1);
+	view_->zoom(1);
 }
 
 void MainWindow::on_actionViewZoomOut_triggered()
 {
-	_view->zoom(-1);
+	view_->zoom(-1);
 }
 
 void MainWindow::on_actionViewZoomFit_triggered()
 {
-	_view->zoom_fit();
+	view_->zoom_fit(action_view_zoom_fit_->isChecked());
 }
 
 void MainWindow::on_actionViewZoomOneToOne_triggered()
 {
-	_view->zoom_one_to_one();
+	view_->zoom_one_to_one();
+}
+
+void MainWindow::on_actionViewStickyScrolling_triggered()
+{
+	view_->enable_sticky_scrolling(action_view_sticky_scrolling_->isChecked());
+}
+
+void MainWindow::on_actionViewColouredBg_triggered()
+{
+	view_->enable_coloured_bg(action_view_coloured_bg_->isChecked());
 }
 
 void MainWindow::on_actionViewShowCursors_triggered()
 {
-	assert(_view);
+	assert(view_);
 
-	const bool show = !_view->cursors_shown();
-	if(show)
-		_view->centre_cursors();
+	const bool show = !view_->cursors_shown();
+	if (show)
+		view_->centre_cursors();
 
-	_view->show_cursors(show);
+	view_->show_cursors(show);
 }
 
 void MainWindow::on_actionAbout_triggered()
 {
-	dialogs::About dlg(this);
+	dialogs::About dlg(device_manager_.context(), this);
 	dlg.exec();
+}
+
+void MainWindow::sticky_scrolling_changed(bool state)
+{
+	action_view_sticky_scrolling_->setChecked(state);
+}
+
+void MainWindow::always_zoom_to_fit_changed(bool state)
+{
+	action_view_zoom_fit_->setChecked(state);
 }
 
 void MainWindow::add_decoder(srd_decoder *decoder)
 {
 #ifdef ENABLE_DECODE
 	assert(decoder);
-	_session.add_decoder(decoder);
+	session_.add_decoder(decoder);
 #else
 	(void)decoder;
 #endif
 }
 
-void MainWindow::run_stop()
-{
-	switch(_session.get_capture_state()) {
-	case SigSession::Stopped:
-		_session.start_capture(
-				boost::bind(&MainWindow::session_error, this,
-				QString("Capture failed"), _1));
-		break;
-
-	case SigSession::AwaitingTrigger:
-	case SigSession::Running:
-		_session.stop_capture();
-		break;
-	}
-}
-
 void MainWindow::capture_state_changed(int state)
 {
-	_sampling_bar->set_capture_state((pv::SigSession::capture_state)state);
+	main_bar_->set_capture_state((pv::Session::capture_state)state);
+}
+
+void MainWindow::device_selected()
+{
+	// Set the title to include the device/file name
+	const shared_ptr<devices::Device> device = session_.device();
+	if (!device)
+		return;
+
+	const string display_name = device->display_name(device_manager_);
+	setWindowTitle(tr("%1 - PulseView").arg(display_name.c_str()));
 }
 
 } // namespace pv

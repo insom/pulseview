@@ -18,14 +18,15 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#include <boost/foreach.hpp>
+#include <cassert>
 
-#include "analog.h"
-#include "analogsnapshot.h"
+#include "analog.hpp"
+#include "analogsegment.hpp"
 
-using boost::shared_ptr;
 using std::deque;
 using std::max;
+using std::shared_ptr;
+using std::vector;
 
 namespace pv {
 namespace data {
@@ -35,25 +36,31 @@ Analog::Analog() :
 {
 }
 
-void Analog::push_snapshot(shared_ptr<AnalogSnapshot> &snapshot)
+void Analog::push_segment(shared_ptr<AnalogSegment> &segment)
 {
-	_snapshots.push_front(snapshot);
+	segments_.push_front(segment);
 }
 
-deque< shared_ptr<AnalogSnapshot> >& Analog::get_snapshots()
+const deque< shared_ptr<AnalogSegment> >& Analog::analog_segments() const
 {
-	return _snapshots;
+	return segments_;
+}
+
+vector< shared_ptr<Segment> > Analog::segments() const
+{
+	return vector< shared_ptr<Segment> >(
+		segments_.begin(), segments_.end());
 }
 
 void Analog::clear()
 {
-	_snapshots.clear();
+	segments_.clear();
 }
 
-uint64_t Analog::get_max_sample_count() const
+uint64_t Analog::max_sample_count() const
 {
 	uint64_t l = 0;
-	BOOST_FOREACH(const boost::shared_ptr<AnalogSnapshot> s, _snapshots) {
+	for (const std::shared_ptr<AnalogSegment> s : segments_) {
 		assert(s);
 		l = max(l, s->get_sample_count());
 	}

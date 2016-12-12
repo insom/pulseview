@@ -1,8 +1,8 @@
-.TH PULSEVIEW 1 "May 4, 2013"
+.TH PULSEVIEW 1 "December 16, 2015"
 .SH "NAME"
 PulseView \- Qt-based LA/scope/MSO GUI for sigrok
 .SH "SYNOPSIS"
-.B pulseview \fR[\fB\-lh?V\fR] [\fB\-l\fR|\fB\-\-loglevel\fR] [\fB\-h\fR|\fB\-?\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fBfile.sr\fR]
+.B pulseview \fR[\fBOPTIONS\fR] [\fBfile.sr\fR]
 .SH "DESCRIPTION"
 .B PulseView
 is a cross-platform Qt-based GUI for the
@@ -39,6 +39,65 @@ Show a help text and exit.
 .TP
 .B "\-V, \-\-version"
 Show version information and exit.
+.TP
+.BR "\-i, \-\-input\-file " <filename>
+Load input from a file. If the
+.B \-\-input\-format
+option is not supplied, PulseView attempts to load the file as a sigrok session
+file.
+.TP
+.BR "\-I, \-\-input\-format " <format>
+Specifies the format of the input file to be loaded.
+.SH "KEYBOARD SHORTCUTS"
+.TP
+.B "f"
+Zoom-to-fit.
+.TP
+.B "o"
+Zoom 1:1.
+.TP
+.B "s"
+Enable / disable sticky scrolling.
+.TP
+.B "c"
+Show / hide cursors.
+.TP
+.B "b"
+Toggle between coloured trace backgrounds and alternating light/dark
+gray trace backgrounds.
+.TP
+.B "SPACE"
+Start / stop an acquisition.
+.TP
+.B "ALT"
+Show / hide the menu.
+.TP
+.B "Arrow keys"
+Scroll up/down/left/right.
+.TP
+.B "CTRL+o"
+Open file.
+.TP
+.B "CTRL+s"
+Save as...
+.TP
+.B "CTRL+r"
+Save selected range as...
+.TP
+.B "CTRL+g"
+Group all currently selected traces into a trace group.
+.TP
+.B "CTRL+u"
+Ungroup the traces in the currently selected trace group.
+.TP
+.B "CTRL++"
+Zoom in.
+.TP
+.B "CTRL+-"
+Zoom out.
+.TP
+.B "CTRL+q"
+Quit, i.e. shutdown PulseView.
 .SH "EXIT STATUS"
 .B PulseView
 exits with 0 on success, 1 on most failures.

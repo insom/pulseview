@@ -18,30 +18,41 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#include "storeprogress.h"
+#include <cassert>
 
 #include <QMessageBox>
+
+#include "storeprogress.hpp"
+
+using std::map;
+using std::string;
+
+using Glib::VariantBase;
 
 namespace pv {
 namespace dialogs {
 
 StoreProgress::StoreProgress(const QString &file_name,
-	const SigSession &session, QWidget *parent) :
+	const std::shared_ptr<sigrok::OutputFormat> output_format,
+	const map<string, VariantBase> &options,
+	const std::pair<uint64_t, uint64_t> sample_range,
+	const Session &session, QWidget *parent) :
 	QProgressDialog(tr("Saving..."), tr("Cancel"), 0, 0, parent),
-	_session(file_name.toStdString(), session)
+	session_(file_name.toStdString(), output_format, options, sample_range,
+		session)
 {
-	connect(&_session, SIGNAL(progress_updated()),
+	connect(&session_, SIGNAL(progress_updated()),
 		this, SLOT(on_progress_updated()));
 }
 
 StoreProgress::~StoreProgress()
 {
-	_session.wait();
+	session_.wait();
 }
 
 void StoreProgress::run()
 {
-	if (_session.start())
+	if (session_.start())
 		show();
 	else
 		show_error();
@@ -51,7 +62,7 @@ void StoreProgress::show_error()
 {
 	QMessageBox msg(parentWidget());
 	msg.setText(tr("Failed to save session."));
-	msg.setInformativeText(_session.error());
+	msg.setInformativeText(session_.error());
 	msg.setStandardButtons(QMessageBox::Ok);
 	msg.setIcon(QMessageBox::Warning);
 	msg.exec();
@@ -59,25 +70,23 @@ void StoreProgress::show_error()
 
 void StoreProgress::closeEvent(QCloseEvent*)
 {
-	_session.cancel();
+	session_.cancel();
 }
 
 void StoreProgress::on_progress_updated()
 {
-	const std::pair<uint64_t, uint64_t> p = _session.progress();
+	const std::pair<int, int> p = session_.progress();
 	assert(p.first <= p.second);
 
-	setValue(p.first);
-	setMaximum(p.second);
-
-	const QString err = _session.error();
-	if (!err.isEmpty()) {
-		show_error();
+	if (p.second) {
+		setValue(p.first);
+		setMaximum(p.second);
+	} else {
+		const QString err = session_.error();
+		if (!err.isEmpty())
+			show_error();
 		close();
 	}
-
-	if (p.first == p.second)
-		close();
 }
 
 } // dialogs

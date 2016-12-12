@@ -18,31 +18,13 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#include "signaldata.h"
+#include "signaldata.hpp"
 
 namespace pv {
 namespace data {
 
-SignalData::SignalData() :
-	_start_time(0),
-	_samplerate(0)
+SignalData::SignalData()
 {
-}
-
-double SignalData::samplerate() const
-{
-	return _samplerate;
-}
-
-void SignalData::set_samplerate(double samplerate)
-{
-	_samplerate = samplerate;
-	clear();
-}
-
-double SignalData::get_start_time() const
-{
-	return _start_time;
 }
 
 } // namespace data

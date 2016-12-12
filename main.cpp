@@ -23,19 +23,24 @@
 #endif
 
 #include <stdint.h>
-#include <libsigrok/libsigrok.h>
+#include <libsigrokcxx/libsigrokcxx.hpp>
 
 #include <getopt.h>
 
-#include <QtGui/QApplication>
 #include <QDebug>
 
 #ifdef ENABLE_SIGNALS
-#include "signalhandler.h"
+#include "signalhandler.hpp"
 #endif
 
-#include "pv/devicemanager.h"
-#include "pv/mainwindow.h"
+#include "pv/application.hpp"
+#include "pv/devicemanager.hpp"
+#include "pv/mainwindow.hpp"
+#ifdef ANDROID
+#include <libsigrokandroidutils/libsigrokandroidutils.h>
+#include "android/assetreader.hpp"
+#include "android/loghandler.hpp"
+#endif
 
 #include "config.h"
 
@@ -49,47 +54,64 @@ void usage()
 {
 	fprintf(stdout,
 		"Usage:\n"
-		"  %s [OPTION…] [FILE] — %s\n"
+		"  %s [OPTION…] — %s\n"
 		"\n"
 		"Help Options:\n"
-		"  -l, --loglevel                  Set libsigrok/libsigrokdecode loglevel\n"
-		"  -V, --version                   Show release version\n"
 		"  -h, -?, --help                  Show help option\n"
+		"\n"
+		"Application Options:\n"
+		"  -V, --version                   Show release version\n"
+		"  -l, --loglevel                  Set libsigrok/libsigrokdecode loglevel\n"
+		"  -i, --input-file                Load input from file\n"
+		"  -I, --input-format              Input format\n"
 		"\n", PV_BIN_NAME, PV_DESCRIPTION);
 }
 
 int main(int argc, char *argv[])
 {
 	int ret = 0;
-	struct sr_context *sr_ctx = NULL;
-	const char *open_file = NULL;
+	std::shared_ptr<sigrok::Context> context;
+	std::string open_file, open_file_format;
 
-	QApplication a(argc, argv);
+	Application a(argc, argv);
 
-	// Set some application metadata
-	QApplication::setApplicationVersion(PV_VERSION_STRING);
-	QApplication::setApplicationName("PulseView");
-	QApplication::setOrganizationDomain("http://www.sigrok.org");
+#ifdef ANDROID
+	srau_init_environment();
+	pv::AndroidLogHandler::install_callbacks();
+	pv::AndroidAssetReader asset_reader;
+#endif
 
 	// Parse arguments
 	while (1) {
 		static const struct option long_options[] = {
-			{"loglevel", required_argument, 0, 'l'},
-			{"version", no_argument, 0, 'V'},
 			{"help", no_argument, 0, 'h'},
+			{"version", no_argument, 0, 'V'},
+			{"loglevel", required_argument, 0, 'l'},
+			{"input-file", required_argument, 0, 'i'},
+			{"input-format", required_argument, 0, 'I'},
 			{0, 0, 0, 0}
 		};
 
 		const int c = getopt_long(argc, argv,
-			"l:Vh?", long_options, NULL);
+			"l:Vh?i:I:", long_options, nullptr);
 		if (c == -1)
 			break;
 
 		switch (c) {
+		case 'h':
+		case '?':
+			usage();
+			return 0;
+
+		case 'V':
+			// Print version info
+			fprintf(stdout, "%s %s\n", PV_TITLE, PV_VERSION_STRING);
+			return 0;
+
 		case 'l':
 		{
 			const int loglevel = atoi(optarg);
-			sr_log_loglevel_set(loglevel);
+			context->set_log_level(sigrok::LogLevel::get(loglevel));
 
 #ifdef ENABLE_DECODE
 			srd_log_loglevel_set(loglevel);
@@ -98,35 +120,33 @@ int main(int argc, char *argv[])
 			break;
 		}
 
-		case 'V':
-			// Print version info
-			fprintf(stdout, "%s %s\n", PV_TITLE, PV_VERSION_STRING);
-			return 0;
+		case 'i':
+			open_file = optarg;
+			break;
 
-		case 'h':
-		case '?':
-			usage();
-			return 0;
+		case 'I':
+			open_file_format = optarg;
+			break;
 		}
 	}
 
 	if (argc - optind > 1) {
-		fprintf(stderr, "Only one file can be openened.\n");
+		fprintf(stderr, "Only one file can be opened.\n");
 		return 1;
-	} else if (argc - optind == 1)
+	} else if (argc - optind == 1) {
 		open_file = argv[argc - 1];
-
-	// Initialise libsigrok
-	if (sr_init(&sr_ctx) != SR_OK) {
-		qDebug() << "ERROR: libsigrok init failed.";
-		return 1;
 	}
 
+	// Initialise libsigrok
+	context = sigrok::Context::create();
+#ifdef ANDROID
+	context->set_resource_reader(&asset_reader);
+#endif
 	do {
 
 #ifdef ENABLE_DECODE
 		// Initialise libsigrokdecode
-		if (srd_init(NULL) != SRD_OK) {
+		if (srd_init(nullptr) != SRD_OK) {
 			qDebug() << "ERROR: libsigrokdecode init failed.";
 			break;
 		}
@@ -137,14 +157,15 @@ int main(int argc, char *argv[])
 
 		try {
 			// Create the device manager, initialise the drivers
-			pv::DeviceManager device_manager(sr_ctx);
+			pv::DeviceManager device_manager(context);
 
 			// Initialise the main window
-			pv::MainWindow w(device_manager, open_file);
+			pv::MainWindow w(device_manager,
+				open_file, open_file_format);
 			w.show();
 
 #ifdef ENABLE_SIGNALS
-			if(SignalHandler::prepare_signals()) {
+			if (SignalHandler::prepare_signals()) {
 				SignalHandler *const handler =
 					new SignalHandler(&w);
 				QObject::connect(handler,
@@ -153,7 +174,7 @@ int main(int argc, char *argv[])
 				QObject::connect(handler,
 					SIGNAL(term_received()),
 					&w, SLOT(close()));
-    			} else {
+			} else {
 				qWarning() <<
 					"Could not prepare signal handler.";
 			}
@@ -162,7 +183,7 @@ int main(int argc, char *argv[])
 			// Run the application
 			ret = a.exec();
 
-		} catch(std::exception e) {
+		} catch (std::exception e) {
 			qDebug() << e.what();
 		}
 
@@ -172,10 +193,6 @@ int main(int argc, char *argv[])
 #endif
 
 	} while (0);
-
-	// Destroy libsigrok
-	if (sr_ctx)
-		sr_exit(sr_ctx);
 
 	return ret;
 }

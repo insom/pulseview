@@ -23,7 +23,11 @@
 #include <QLineEdit>
 #include <QSpinBox>
 
-#include "string.h"
+#include "string.hpp"
+
+using std::string;
+
+using Glib::ustring;
 
 namespace pv {
 namespace prop {
@@ -32,40 +36,44 @@ String::String(QString name,
 	Getter getter,
 	Setter setter) :
 	Property(name, getter, setter),
-	_line_edit(NULL)
+	line_edit_(nullptr)
 {
 }
 
 QWidget* String::get_widget(QWidget *parent, bool auto_commit)
 {
-	if (_line_edit)
-		return _line_edit;
+	if (line_edit_)
+		return line_edit_;
 
-	GVariant *const value = _getter ? _getter() : NULL;
-	if (!value)
-		return NULL;
+	if (!getter_)
+		return nullptr;
 
-	_line_edit = new QLineEdit(parent);
-	_line_edit->setText(QString::fromUtf8(
-		g_variant_get_string(value, NULL)));
-	g_variant_unref(value);
+	Glib::VariantBase variant = getter_();
+	if (!variant.gobj())
+		return nullptr;
+
+	string value = Glib::VariantBase::cast_dynamic<Glib::Variant<ustring>>(
+		variant).get();
+
+	line_edit_ = new QLineEdit(parent);
+	line_edit_->setText(QString::fromStdString(value));
 
 	if (auto_commit)
-		connect(_line_edit, SIGNAL(textEdited(const QString&)),
+		connect(line_edit_, SIGNAL(textEdited(const QString&)),
 			this, SLOT(on_text_edited(const QString&)));
 
-	return _line_edit;
+	return line_edit_;
 }
 
 void String::commit()
 {
-	assert(_setter);
+	assert(setter_);
 
-	if (!_line_edit)
+	if (!line_edit_)
 		return;
 
-	QByteArray ba = _line_edit->text().toLocal8Bit();
-	_setter(g_variant_new_string(ba.data()));
+	QByteArray ba = line_edit_->text().toLocal8Bit();
+	setter_(Glib::Variant<ustring>::create(ba.data()));
 }
 
 void String::on_text_edited(const QString&)

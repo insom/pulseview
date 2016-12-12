@@ -21,32 +21,35 @@
 #include <extdef.h>
 
 #include <assert.h>
-#include <math.h>
+#include <cmath>
 
 #include <QApplication>
 #include <QFormLayout>
+#include <QKeyEvent>
+#include <QLineEdit>
 #include <QMenu>
 
-#include <libsigrok/libsigrok.h>
+#include <libsigrokcxx/libsigrokcxx.hpp>
 
-#include "signal.h"
-#include "view.h"
+#include "signal.hpp"
+#include "view.hpp"
 
-#include <pv/device/devinst.h>
+using std::shared_ptr;
+using std::make_shared;
 
-using boost::shared_ptr;
+using sigrok::Channel;
 
 namespace pv {
 namespace view {
 
-const char *const ProbeNames[] = {
+const char *const ChannelNames[] = {
 	"CLK",
 	"DATA",
 	"IN",
 	"OUT",
 	"RST",
-	"Tx",
-	"Rx",
+	"TX",
+	"RX",
 	"EN",
 	"SCLK",
 	"MOSI",
@@ -56,54 +59,81 @@ const char *const ProbeNames[] = {
 	"SCL"
 };
 
-Signal::Signal(shared_ptr<pv::device::DevInst> dev_inst,
-	const sr_channel *const probe) :
-	Trace(probe->name),
-	_dev_inst(dev_inst),
-	_probe(probe),
-	_name_widget(NULL),
-	_updating_name_widget(false)
+Signal::Signal(pv::Session &session,
+	std::shared_ptr<sigrok::Channel> channel) :
+	Trace(QString::fromUtf8(channel->name().c_str())),
+	session_(session),
+	channel_(channel),
+	scale_handle_(make_shared<SignalScaleHandle>(*this)),
+	items_({scale_handle_}),
+	name_widget_(nullptr)
 {
-	assert(_probe);
+	assert(channel_);
 }
 
 void Signal::set_name(QString name)
 {
 	Trace::set_name(name);
-	_updating_name_widget = true;
-	_name_widget->setEditText(name);
-	_updating_name_widget = false;
+
+	if (name != name_widget_->currentText())
+		name_widget_->setEditText(name);
+
+	// Store the channel name in sigrok::Channel so that it
+	// will end up in the .sr file upon save.
+	channel_->set_name(name.toUtf8().constData());
 }
 
 bool Signal::enabled() const
 {
-	return _probe->enabled;
+	return channel_->enabled();
 }
 
 void Signal::enable(bool enable)
 {
-	_dev_inst->enable_probe(_probe, enable);
-	visibility_changed();
+	channel_->set_enabled(enable);
+
+	if (owner_)
+		owner_->extents_changed(true, true);
 }
 
-const sr_channel* Signal::probe() const
+shared_ptr<Channel> Signal::channel() const
 {
-	return _probe;
+	return channel_;
+}
+
+const ViewItemOwner::item_list& Signal::child_items() const
+{
+	return items_;
+}
+
+void Signal::paint_back(QPainter &p, const ViewItemPaintParams &pp)
+{
+	if (channel_->enabled())
+		Trace::paint_back(p, pp);
 }
 
 void Signal::populate_popup_form(QWidget *parent, QFormLayout *form)
 {
-	_name_widget = new QComboBox(parent);
-	_name_widget->setEditable(true);
+	name_widget_ = new QComboBox(parent);
+	name_widget_->setEditable(true);
+	name_widget_->setCompleter(0);
 
-	for(unsigned int i = 0; i < countof(ProbeNames); i++)
-		_name_widget->insertItem(i, ProbeNames[i]);
-	_name_widget->setEditText(_probe->name);
+	for (unsigned int i = 0; i < countof(ChannelNames); i++)
+		name_widget_->insertItem(i, ChannelNames[i]);
 
-	connect(_name_widget, SIGNAL(editTextChanged(const QString&)),
+	const int index = name_widget_->findText(name_, Qt::MatchExactly);
+
+	if (index == -1) {
+		name_widget_->insertItem(0, name_);
+		name_widget_->setCurrentIndex(0);
+	} else {
+		name_widget_->setCurrentIndex(index);
+	}
+
+	connect(name_widget_, SIGNAL(editTextChanged(const QString&)),
 		this, SLOT(on_text_changed(const QString&)));
 
-	form->addRow(tr("Name"), _name_widget);
+	form->addRow(tr("Name"), name_widget_);
 
 	add_colour_option(parent, form);
 }
