@@ -18,46 +18,75 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#include "cursorpair.h"
+#include "cursorpair.hpp"
 
-#include "ruler.h"
-#include "view.h"
+#include "ruler.hpp"
+#include "view.hpp"
+#include "pv/util.hpp"
 
+#include <cassert>
 #include <algorithm>
 
-using boost::shared_ptr;
 using std::max;
 using std::make_pair;
 using std::min;
+using std::shared_ptr;
 using std::pair;
 
 namespace pv {
 namespace view {
 
 const int CursorPair::DeltaPadding = 8;
+const QColor CursorPair::ViewportFillColour(220, 231, 243);
 
 CursorPair::CursorPair(View &view) :
-	_first(new Cursor(view, 0.0)),
-	_second(new Cursor(view, 1.0)),
-	_view(view)
+	TimeItem(view),
+	first_(new Cursor(view, 0.0)),
+	second_(new Cursor(view, 1.0))
 {
+}
+
+bool CursorPair::enabled() const
+{
+	return view_.cursors_shown();
 }
 
 shared_ptr<Cursor> CursorPair::first() const
 {
-	return _first;
+	return first_;
 }
 
 shared_ptr<Cursor> CursorPair::second() const
 {
-	return _second;
+	return second_;
 }
 
-QRectF CursorPair::get_label_rect(const QRect &rect) const
+void CursorPair::set_time(const pv::util::Timestamp& time)
 {
-	const QSizeF label_size(
-		_text_size.width() + View::LabelPadding.width() * 2,
-		_text_size.height() + View::LabelPadding.height() * 2);
+	const pv::util::Timestamp delta = second_->time() - first_->time();
+	first_->set_time(time);
+	second_->set_time(time + delta);
+}
+
+float CursorPair::get_x() const
+{
+	return (first_->get_x() + second_->get_x()) / 2.0f;
+}
+
+QPoint CursorPair::point(const QRect &rect) const
+{
+	return first_->point(rect);
+}
+
+pv::widgets::Popup* CursorPair::create_popup(QWidget *parent)
+{
+	(void)parent;
+	return nullptr;
+}
+
+QRectF CursorPair::label_rect(const QRectF &rect) const
+{
+	const QSizeF label_size(text_size_ + LabelPadding * 2);
 	const pair<float, float> offsets(get_cursor_offsets());
 	const pair<float, float> normal_offsets(
 		(offsets.first < offsets.second) ? offsets :
@@ -69,86 +98,98 @@ QRectF CursorPair::get_label_rect(const QRect &rect) const
 		(float)rect.width() + height);
 
 	return QRectF(left, rect.height() - label_size.height() -
-		Cursor::ArrowSize - Cursor::Offset - 0.5f,
+		TimeMarker::ArrowSize - 0.5f,
 		right - left, height);
 }
 
-void CursorPair::draw_markers(QPainter &p,
-	const QRect &rect, unsigned int prefix)
+void CursorPair::paint_label(QPainter &p, const QRect &rect, bool hover)
 {
-	assert(_first);
-	assert(_second);
+	assert(first_);
+	assert(second_);
 
-	compute_text_size(p, prefix);
-	QRectF delta_rect(get_label_rect(rect));
+	if (!enabled())
+		return;
+
+	const QColor text_colour =
+		ViewItem::select_text_colour(Cursor::FillColour);
+
+	p.setPen(text_colour);
+	compute_text_size(p);
+	QRectF delta_rect(label_rect(rect));
 
 	const int radius = delta_rect.height() / 2;
 	const QRectF text_rect(delta_rect.intersected(
 		rect).adjusted(radius, 0, -radius, 0));
-	if(text_rect.width() >= _text_size.width())
-	{
+	if (text_rect.width() >= text_size_.width()) {
 		const int highlight_radius = delta_rect.height() / 2 - 2;
 
-		p.setBrush(Cursor::FillColour);
-		p.setPen(Cursor::LineColour);
+		if (selected()) {
+			p.setBrush(Qt::transparent);
+			p.setPen(highlight_pen());
+			p.drawRoundedRect(delta_rect, radius, radius);
+		}
+
+		p.setBrush(hover ? Cursor::FillColour.lighter() :
+			Cursor::FillColour);
+		p.setPen(Cursor::FillColour.darker());
 		p.drawRoundedRect(delta_rect, radius, radius);
 
 		delta_rect.adjust(1, 1, -1, -1);
-		p.setPen(Cursor::HighlightColour);
+		p.setPen(Cursor::FillColour.lighter());
 		p.drawRoundedRect(delta_rect, highlight_radius, highlight_radius);
 
-		p.setPen(Cursor::TextColour);
+		p.setPen(text_colour);
 		p.drawText(text_rect, Qt::AlignCenter | Qt::AlignVCenter,
-			Ruler::format_time(_second->time() - _first->time(), prefix, 2));
+			format_string());
 	}
-
-	// Paint the cursor markers
-	_first->paint_label(p, rect, prefix);
-	_second->paint_label(p, rect, prefix);
 }
 
-void CursorPair::draw_viewport_background(QPainter &p,
-	const QRect &rect)
+void CursorPair::paint_back(QPainter &p, const ViewItemPaintParams &pp)
 {
+	if (!enabled())
+		return;
+
 	p.setPen(Qt::NoPen);
-	p.setBrush(QBrush(View::CursorAreaColour));
+	p.setBrush(QBrush(ViewportFillColour));
 
 	const pair<float, float> offsets(get_cursor_offsets());
 	const int l = (int)max(min(
 		offsets.first, offsets.second), 0.0f);
 	const int r = (int)min(max(
-		offsets.first, offsets.second), (float)rect.width());
+		offsets.first, offsets.second), (float)pp.width());
 
-	p.drawRect(l, 0, r - l, rect.height());
+	p.drawRect(l, pp.top(), r - l, pp.height());
 }
 
-void CursorPair::draw_viewport_foreground(QPainter &p,
-	const QRect &rect)
+QString CursorPair::format_string()
 {
-	assert(_first);
-	assert(_second);
+	const pv::util::SIPrefix prefix = view_.tick_prefix();
+	const pv::util::Timestamp diff = abs(second_->time() - first_->time());
 
-	_first->paint(p, rect);
-	_second->paint(p, rect);
+	const QString s1 = Ruler::format_time_with_distance(
+		diff, diff, prefix, view_.time_unit(), view_.tick_precision(), false);
+	const QString s2 = util::format_time_si(
+		1 / diff, pv::util::SIPrefix::unspecified, 4, "Hz", false);
+
+	return QString("%1 / %2").arg(s1).arg(s2);
 }
 
-void CursorPair::compute_text_size(QPainter &p, unsigned int prefix)
+void CursorPair::compute_text_size(QPainter &p)
 {
-	assert(_first);
-	assert(_second);
+	assert(first_);
+	assert(second_);
 
-	_text_size = p.boundingRect(QRectF(), 0, Ruler::format_time(
-		_second->time() - _first->time(), prefix, 2)).size();
+	text_size_ = p.boundingRect(QRectF(), 0, format_string()).size();
 }
 
 pair<float, float> CursorPair::get_cursor_offsets() const
 {
-	assert(_first);
-	assert(_second);
+	assert(first_);
+	assert(second_);
 
 	return pair<float, float>(
-		(_first->time() - _view.offset()) / _view.scale(),
-		(_second->time() - _view.offset()) / _view.scale());
+		((first_->time() - view_.offset()) / view_.scale()).convert_to<float>(),
+		((second_->time() - view_.offset()) / view_.scale()).convert_to<float>());
 }
 
 } // namespace view

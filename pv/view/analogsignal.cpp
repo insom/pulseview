@@ -20,20 +20,30 @@
 
 #include <extdef.h>
 
-#include <math.h>
+#include <cassert>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
 
-#include "analogsignal.h"
-#include "pv/data/analog.h"
-#include "pv/data/analogsnapshot.h"
-#include "pv/view/view.h"
+#include "analogsignal.hpp"
+#include "pv/data/analog.hpp"
+#include "pv/data/analogsegment.hpp"
+#include "pv/view/view.hpp"
 
-using boost::shared_ptr;
+#include <libsigrokcxx/libsigrokcxx.hpp>
+
 using std::max;
+using std::make_pair;
 using std::min;
+using std::shared_ptr;
 using std::deque;
+
+using sigrok::Channel;
 
 namespace pv {
 namespace view {
+
+const int AnalogSignal::NominalHeight = 80;
 
 const QColor AnalogSignal::SignalColours[4] = {
 	QColor(0xC4, 0xA0, 0x00),	// Yellow
@@ -44,13 +54,16 @@ const QColor AnalogSignal::SignalColours[4] = {
 
 const float AnalogSignal::EnvelopeThreshold = 256.0f;
 
-AnalogSignal::AnalogSignal(shared_ptr<pv::device::DevInst> dev_inst,
-	const sr_channel *const probe, shared_ptr<data::Analog> data) :
-	Signal(dev_inst, probe),
-	_data(data),
-	_scale(1.0f)
+AnalogSignal::AnalogSignal(
+	pv::Session &session,
+	shared_ptr<Channel> channel,
+	shared_ptr<data::Analog> data) :
+	Signal(session, channel),
+	data_(data),
+	scale_index_(0),
+	scale_index_drag_offset_(0)
 {
-	_colour = SignalColours[probe->index % countof(SignalColours)];
+	set_colour(SignalColours[channel_->index() % countof(SignalColours)]);
 }
 
 AnalogSignal::~AnalogSignal()
@@ -59,83 +72,98 @@ AnalogSignal::~AnalogSignal()
 
 shared_ptr<pv::data::SignalData> AnalogSignal::data() const
 {
-	return _data;
+	return data_;
 }
 
 shared_ptr<pv::data::Analog> AnalogSignal::analog_data() const
 {
-	return _data;
+	return data_;
 }
 
-void AnalogSignal::set_scale(float scale)
+std::pair<int, int> AnalogSignal::v_extents() const
 {
-	_scale = scale;
+	const int h = NominalHeight / 2;
+	return make_pair(-h, h);
 }
 
-void AnalogSignal::paint_back(QPainter &p, int left, int right)
+int AnalogSignal::scale_handle_offset() const
 {
-	if (_probe->enabled)
-		paint_axis(p, get_y(), left, right);
+	return ((scale_index_drag_offset_ - scale_index_) *
+		NominalHeight / 4) - NominalHeight / 2;
 }
 
-void AnalogSignal::paint_mid(QPainter &p, int left, int right)
+void AnalogSignal::scale_handle_dragged(int offset)
 {
-	assert(_data);
-	assert(right >= left);
+	scale_index_ = scale_index_drag_offset_ -
+		(offset + NominalHeight / 2) / (NominalHeight / 4);
+}
 
-	assert(_view);
-	const int y = _v_offset - _view->v_offset();
+void AnalogSignal::scale_handle_drag_release()
+{
+	scale_index_drag_offset_ = scale_index_;
+}
 
-	const double scale = _view->scale();
-	assert(scale > 0);
+void AnalogSignal::paint_back(QPainter &p, const ViewItemPaintParams &pp)
+{
+	if (channel_->enabled()) {
+		Trace::paint_back(p, pp);
+		paint_axis(p, pp, get_visual_y());
+	}
+}
 
-	const double offset = _view->offset();
+void AnalogSignal::paint_mid(QPainter &p, const ViewItemPaintParams &pp)
+{
+	assert(data_);
+	assert(owner_);
 
-	if (!_probe->enabled)
+	const int y = get_visual_y();
+
+	if (!channel_->enabled())
 		return;
 
-	const deque< shared_ptr<pv::data::AnalogSnapshot> > &snapshots =
-		_data->get_snapshots();
-	if (snapshots.empty())
+	const deque< shared_ptr<pv::data::AnalogSegment> > &segments =
+		data_->analog_segments();
+	if (segments.empty())
 		return;
 
-	const shared_ptr<pv::data::AnalogSnapshot> &snapshot =
-		snapshots.front();
+	const shared_ptr<pv::data::AnalogSegment> &segment =
+		segments.front();
 
-	const double pixels_offset = offset / scale;
-	const double samplerate = _data->samplerate();
-	const double start_time = _data->get_start_time();
-	const int64_t last_sample = snapshot->get_sample_count() - 1;
-	const double samples_per_pixel = samplerate * scale;
-	const double start = samplerate * (offset - start_time);
-	const double end = start + samples_per_pixel * (right - left);
+	const double pixels_offset = pp.pixels_offset();
+	const double samplerate = max(1.0, segment->samplerate());
+	const pv::util::Timestamp& start_time = segment->start_time();
+	const int64_t last_sample = segment->get_sample_count() - 1;
+	const double samples_per_pixel = samplerate * pp.scale();
+	const pv::util::Timestamp start = samplerate * (pp.offset() - start_time);
+	const pv::util::Timestamp end = start + samples_per_pixel * pp.width();
 
-	const int64_t start_sample = min(max((int64_t)floor(start),
+	const int64_t start_sample = min(max(floor(start).convert_to<int64_t>(),
 		(int64_t)0), last_sample);
-	const int64_t end_sample = min(max((int64_t)ceil(end) + 1,
+	const int64_t end_sample = min(max((ceil(end) + 1).convert_to<int64_t>(),
 		(int64_t)0), last_sample);
 
 	if (samples_per_pixel < EnvelopeThreshold)
-		paint_trace(p, snapshot, y, left,
+		paint_trace(p, segment, y, pp.left(),
 			start_sample, end_sample,
 			pixels_offset, samples_per_pixel);
 	else
-		paint_envelope(p, snapshot, y, left,
+		paint_envelope(p, segment, y, pp.left(),
 			start_sample, end_sample,
 			pixels_offset, samples_per_pixel);
 }
 
 void AnalogSignal::paint_trace(QPainter &p,
-	const shared_ptr<pv::data::AnalogSnapshot> &snapshot,
+	const shared_ptr<pv::data::AnalogSegment> &segment,
 	int y, int left, const int64_t start, const int64_t end,
 	const double pixels_offset, const double samples_per_pixel)
 {
+	const float scale = this->scale();
 	const int64_t sample_count = end - start;
 
-	const float *const samples = snapshot->get_samples(start, end);
+	const float *const samples = segment->get_samples(start, end);
 	assert(samples);
 
-	p.setPen(_colour);
+	p.setPen(colour_);
 
 	QPointF *points = new QPointF[sample_count];
 	QPointF *point = points;
@@ -144,7 +172,7 @@ void AnalogSignal::paint_trace(QPainter &p,
 		const float x = (sample / samples_per_pixel -
 			pixels_offset) + left;
 		*point++ = QPointF(x,
-			y - samples[sample - start] * _scale);
+			y - samples[sample - start] * scale);
 	}
 
 	p.drawPolyline(points, point - points);
@@ -154,39 +182,41 @@ void AnalogSignal::paint_trace(QPainter &p,
 }
 
 void AnalogSignal::paint_envelope(QPainter &p,
-	const shared_ptr<pv::data::AnalogSnapshot> &snapshot,
+	const shared_ptr<pv::data::AnalogSegment> &segment,
 	int y, int left, const int64_t start, const int64_t end,
 	const double pixels_offset, const double samples_per_pixel)
 {
-	using pv::data::AnalogSnapshot;
+	using pv::data::AnalogSegment;
 
-	AnalogSnapshot::EnvelopeSection e;
-	snapshot->get_envelope_section(e, start, end, samples_per_pixel);
+	const float scale = this->scale();
+
+	AnalogSegment::EnvelopeSection e;
+	segment->get_envelope_section(e, start, end, samples_per_pixel);
 
 	if (e.length < 2)
 		return;
 
 	p.setPen(QPen(Qt::NoPen));
-	p.setBrush(_colour);
+	p.setBrush(colour_);
 
 	QRectF *const rects = new QRectF[e.length];
 	QRectF *rect = rects;
 
-	for(uint64_t sample = 0; sample < e.length-1; sample++) {
+	for (uint64_t sample = 0; sample < e.length-1; sample++) {
 		const float x = ((e.scale * sample + e.start) /
 			samples_per_pixel - pixels_offset) + left;
-		const AnalogSnapshot::EnvelopeSample *const s =
+		const AnalogSegment::EnvelopeSample *const s =
 			e.samples + sample;
 
 		// We overlap this sample with the next so that vertical
 		// gaps do not appear during steep rising or falling edges
-		const float b = y - max(s->max, (s+1)->min) * _scale;
-		const float t = y - min(s->min, (s+1)->max) * _scale;
+		const float b = y - max(s->max, (s+1)->min) * scale;
+		const float t = y - min(s->min, (s+1)->max) * scale;
 
 		float h = b - t;
-		if(h >= 0.0f && h <= 1.0f)
+		if (h >= 0.0f && h <= 1.0f)
 			h = 1.0f;
-		if(h <= 0.0f && h >= -1.0f)
+		if (h <= 0.0f && h >= -1.0f)
 			h = -1.0f;
 
 		*rect++ = QRectF(x, t, 1.0f, h);
@@ -196,6 +226,16 @@ void AnalogSignal::paint_envelope(QPainter &p,
 
 	delete[] rects;
 	delete[] e.samples;
+}
+
+float AnalogSignal::scale() const
+{
+	const float seq[] = {1.0f, 2.0f, 5.0f};
+	const int offset = std::numeric_limits<int>::max() / (2 * countof(seq));
+	const std::div_t d = std::div(
+		(int)(scale_index_ + countof(seq) * offset),
+		countof(seq));
+	return powf(10.0f, d.quot - offset) * seq[d.rem];
 }
 
 } // namespace view

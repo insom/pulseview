@@ -20,26 +20,43 @@
 
 #include <extdef.h>
 
-#include <math.h>
+#include <cassert>
+#include <cmath>
 
+#include <algorithm>
+
+#include <QApplication>
 #include <QFormLayout>
 #include <QToolBar>
 
-#include "logicsignal.h"
-#include "view.h"
+#include "logicsignal.hpp"
+#include "view.hpp"
 
-#include <pv/sigsession.h>
-#include <pv/device/devinst.h>
-#include <pv/data/logic.h>
-#include <pv/data/logicsnapshot.h>
-#include <pv/view/view.h>
+#include <pv/session.hpp>
+#include <pv/devicemanager.hpp>
+#include <pv/devices/device.hpp>
+#include <pv/data/logic.hpp>
+#include <pv/data/logicsegment.hpp>
+#include <pv/view/view.hpp>
 
-using boost::shared_ptr;
+#include <libsigrokcxx/libsigrokcxx.hpp>
+
 using std::deque;
 using std::max;
+using std::make_pair;
 using std::min;
 using std::pair;
+using std::shared_ptr;
 using std::vector;
+
+using sigrok::Channel;
+using sigrok::ConfigKey;
+using sigrok::Capability;
+using sigrok::Error;
+using sigrok::Trigger;
+using sigrok::TriggerStage;
+using sigrok::TriggerMatch;
+using sigrok::TriggerMatchType;
 
 namespace pv {
 namespace view {
@@ -63,18 +80,50 @@ const QColor LogicSignal::SignalColours[10] = {
 	QColor(0xEE, 0xEE, 0xEC),	// White
 };
 
-LogicSignal::LogicSignal(shared_ptr<pv::device::DevInst> dev_inst,
-	const sr_channel *const probe, shared_ptr<data::Logic> data) :
-	Signal(dev_inst, probe),
-	_data(data),
-	_trigger_none(NULL),
-	_trigger_rising(NULL),
-	_trigger_high(NULL),
-	_trigger_falling(NULL),
-	_trigger_low(NULL),
-	_trigger_change(NULL)
+QColor LogicSignal::TriggerMarkerBackgroundColour = QColor(0xED, 0xD4, 0x00);
+const int LogicSignal::TriggerMarkerPadding = 2;
+const char* LogicSignal::TriggerMarkerIcons[8] = {
+	nullptr,
+	":/icons/trigger-marker-low.svg",
+	":/icons/trigger-marker-high.svg",
+	":/icons/trigger-marker-rising.svg",
+	":/icons/trigger-marker-falling.svg",
+	":/icons/trigger-marker-change.svg",
+	nullptr,
+	nullptr
+};
+
+QCache<QString, const QIcon> LogicSignal::icon_cache_;
+QCache<QString, const QPixmap> LogicSignal::pixmap_cache_;
+
+LogicSignal::LogicSignal(
+	pv::Session &session,
+	shared_ptr<devices::Device> device,
+	shared_ptr<Channel> channel,
+	shared_ptr<data::Logic> data) :
+	Signal(session, channel),
+	signal_height_(QFontMetrics(QApplication::font()).height() * 2),
+	device_(device),
+	data_(data),
+	trigger_none_(nullptr),
+	trigger_rising_(nullptr),
+	trigger_high_(nullptr),
+	trigger_falling_(nullptr),
+	trigger_low_(nullptr),
+	trigger_change_(nullptr)
 {
-	_colour = SignalColours[probe->index % countof(SignalColours)];
+	shared_ptr<Trigger> trigger;
+
+	set_colour(SignalColours[channel->index() % countof(SignalColours)]);
+
+	/* Populate this channel's trigger setting with whatever we
+	 * find in the current session trigger, if anything. */
+	trigger_match_ = nullptr;
+	if ((trigger = session_.session()->trigger()))
+		for (auto stage : trigger->stages())
+			for (auto match : stage->matches())
+				if (match->channel() == channel_)
+					trigger_match_ = match->type();
 }
 
 LogicSignal::~LogicSignal()
@@ -83,71 +132,84 @@ LogicSignal::~LogicSignal()
 
 shared_ptr<pv::data::SignalData> LogicSignal::data() const
 {
-	return _data;
+	return data_;
 }
 
 shared_ptr<pv::data::Logic> LogicSignal::logic_data() const
 {
-	return _data;
+	return data_;
 }
 
-void LogicSignal::paint_back(QPainter &p, int left, int right)
+void LogicSignal::set_logic_data(std::shared_ptr<pv::data::Logic> data)
 {
-	if (_probe->enabled)
-		paint_axis(p, get_y(), left, right);
+	data_ = data;
 }
 
-void LogicSignal::paint_mid(QPainter &p, int left, int right)
+std::pair<int, int> LogicSignal::v_extents() const
 {
-	using pv::view::View;
+	const int signal_margin =
+		QFontMetrics(QApplication::font()).height() / 2;
+	return make_pair(-signal_height_ - signal_margin, signal_margin);
+}
 
+int LogicSignal::scale_handle_offset() const
+{
+	return -signal_height_;
+}
+
+void LogicSignal::scale_handle_dragged(int offset)
+{
+	const int font_height = QFontMetrics(QApplication::font()).height();
+	const int units = (-offset / font_height);
+	signal_height_ = ((units < 1) ? 1 : units) * font_height;
+}
+
+void LogicSignal::paint_mid(QPainter &p, const ViewItemPaintParams &pp)
+{
 	QLineF *line;
 
 	vector< pair<int64_t, bool> > edges;
 
-	assert(_probe);
-	assert(_data);
-	assert(right >= left);
+	assert(channel_);
+	assert(data_);
+	assert(owner_);
 
-	assert(_view);
-	const int y = _v_offset - _view->v_offset();
-	
-	const double scale = _view->scale();
-	assert(scale > 0);
-	
-	const double offset = _view->offset();
+	const int y = get_visual_y();
 
-	if (!_probe->enabled)
+	if (!channel_->enabled())
 		return;
 
-	const float high_offset = y - View::SignalHeight + 0.5f;
+	const float high_offset = y - signal_height_ + 0.5f;
 	const float low_offset = y + 0.5f;
 
-	const deque< shared_ptr<pv::data::LogicSnapshot> > &snapshots =
-		_data->get_snapshots();
-	if (snapshots.empty())
+	const deque< shared_ptr<pv::data::LogicSegment> > &segments =
+		data_->logic_segments();
+	if (segments.empty())
 		return;
 
-	const shared_ptr<pv::data::LogicSnapshot> &snapshot =
-		snapshots.front();
+	const shared_ptr<pv::data::LogicSegment> &segment =
+		segments.front();
 
-	double samplerate = _data->samplerate();
+	double samplerate = segment->samplerate();
 
 	// Show sample rate as 1Hz when it is unknown
 	if (samplerate == 0.0)
 		samplerate = 1.0;
 
-	const double pixels_offset = offset / scale;
-	const double start_time = _data->get_start_time();
-	const int64_t last_sample = snapshot->get_sample_count() - 1;
-	const double samples_per_pixel = samplerate * scale;
-	const double start = samplerate * (offset - start_time);
-	const double end = start + samples_per_pixel * (right - left);
+	const double pixels_offset = pp.pixels_offset();
+	const pv::util::Timestamp& start_time = segment->start_time();
+	const int64_t last_sample = segment->get_sample_count() - 1;
+	const double samples_per_pixel = samplerate * pp.scale();
+	const pv::util::Timestamp start = samplerate * (pp.offset() - start_time);
+	const pv::util::Timestamp end = start + samples_per_pixel * pp.width();
 
-	snapshot->get_subsampled_edges(edges,
-		min(max((int64_t)floor(start), (int64_t)0), last_sample),
-		min(max((int64_t)ceil(end), (int64_t)0), last_sample),
-		samples_per_pixel / Oversampling, _probe->index);
+	const int64_t start_sample = min(max(floor(start).convert_to<int64_t>(),
+		(int64_t)0), last_sample);
+	const uint64_t end_sample = min(max(ceil(end).convert_to<int64_t>(),
+		(int64_t)0), last_sample);
+
+	segment->get_subsampled_edges(edges, start_sample, end_sample,
+		samples_per_pixel / Oversampling, channel_->index());
 	assert(edges.size() >= 2);
 
 	// Paint the edges
@@ -155,11 +217,9 @@ void LogicSignal::paint_mid(QPainter &p, int left, int right)
 	QLineF *const edge_lines = new QLineF[edge_count];
 	line = edge_lines;
 
-	for (vector<pv::data::LogicSnapshot::EdgePair>::const_iterator i =
-			edges.begin() + 1;
-		i != edges.end() - 1; i++) {
+	for (auto i = edges.cbegin() + 1; i != edges.cend() - 1; i++) {
 		const float x = ((*i).first / samples_per_pixel -
-			pixels_offset) + left;
+			pixels_offset) + pp.left();
 		*line++ = QLineF(x, high_offset, x, low_offset);
 	}
 
@@ -173,12 +233,49 @@ void LogicSignal::paint_mid(QPainter &p, int left, int right)
 
 	p.setPen(HighColour);
 	paint_caps(p, cap_lines, edges, true, samples_per_pixel,
-		pixels_offset, left, high_offset);
+		pixels_offset, pp.left(), high_offset);
 	p.setPen(LowColour);
 	paint_caps(p, cap_lines, edges, false, samples_per_pixel,
-		pixels_offset, left, low_offset);
+		pixels_offset, pp.left(), low_offset);
 
 	delete[] cap_lines;
+}
+
+void LogicSignal::paint_fore(QPainter &p, const ViewItemPaintParams &pp)
+{
+	// Draw the trigger marker
+	if (!trigger_match_ || !channel_->enabled())
+		return;
+
+	const int y = get_visual_y();
+	const vector<int32_t> trig_types = get_trigger_types();
+	for (int32_t type_id : trig_types) {
+		const TriggerMatchType *const type =
+			TriggerMatchType::get(type_id);
+		if (trigger_match_ != type || type_id < 0 ||
+			(size_t)type_id >= countof(TriggerMarkerIcons) ||
+			!TriggerMarkerIcons[type_id])
+			continue;
+
+		const QPixmap *const pixmap = get_pixmap(
+			TriggerMarkerIcons[type_id]);
+		if (!pixmap)
+			continue;
+
+		const float pad = TriggerMarkerPadding - 0.5f;
+		const QSize size = pixmap->size();
+		const QPoint point(
+			pp.right() - size.width() - pad * 2,
+			y - (signal_height_ + size.height()) / 2);
+
+		p.setPen(QPen(TriggerMarkerBackgroundColour.darker()));
+		p.setBrush(TriggerMarkerBackgroundColour);
+		p.drawRoundedRect(QRectF(point, size).adjusted(
+			-pad, -pad, pad, pad), pad, pad);
+		p.drawPixmap(point, *pixmap);
+
+		break;
+	}
 }
 
 void LogicSignal::paint_caps(QPainter &p, QLineF *const lines,
@@ -188,8 +285,7 @@ void LogicSignal::paint_caps(QPainter &p, QLineF *const lines,
 {
 	QLineF *line = lines;
 
-	for (vector<pv::data::LogicSnapshot::EdgePair>::const_iterator i =
-		edges.begin(); i != (edges.end() - 1); i++)
+	for (auto i = edges.begin(); i != (edges.end() - 1); i++)
 		if ((*i).second == level) {
 			*line++ = QLineF(
 				((*i).first / samples_per_pixel -
@@ -203,150 +299,191 @@ void LogicSignal::paint_caps(QPainter &p, QLineF *const lines,
 
 void LogicSignal::init_trigger_actions(QWidget *parent)
 {
-	_trigger_none = new QAction(QIcon(":/icons/trigger-none.svg"),
+	trigger_none_ = new QAction(*get_icon(":/icons/trigger-none.svg"),
 		tr("No trigger"), parent);
-	_trigger_none->setCheckable(true);
-	connect(_trigger_none, SIGNAL(triggered()),
-		this, SLOT(on_trigger_none()));
+	trigger_none_->setCheckable(true);
+	connect(trigger_none_, SIGNAL(triggered()), this, SLOT(on_trigger()));
 
-	_trigger_rising = new QAction(QIcon(":/icons/trigger-rising.svg"),
+	trigger_rising_ = new QAction(*get_icon(":/icons/trigger-rising.svg"),
 		tr("Trigger on rising edge"), parent);
-	_trigger_rising->setCheckable(true);
-	connect(_trigger_rising, SIGNAL(triggered()),
-		this, SLOT(on_trigger_rising()));
+	trigger_rising_->setCheckable(true);
+	connect(trigger_rising_, SIGNAL(triggered()), this, SLOT(on_trigger()));
 
-	_trigger_high = new QAction(QIcon(":/icons/trigger-high.svg"),
+	trigger_high_ = new QAction(*get_icon(":/icons/trigger-high.svg"),
 		tr("Trigger on high level"), parent);
-	_trigger_high->setCheckable(true);
-	connect(_trigger_high, SIGNAL(triggered()),
-		this, SLOT(on_trigger_high()));
+	trigger_high_->setCheckable(true);
+	connect(trigger_high_, SIGNAL(triggered()), this, SLOT(on_trigger()));
 
-	_trigger_falling = new QAction(QIcon(":/icons/trigger-falling.svg"),
+	trigger_falling_ = new QAction(*get_icon(":/icons/trigger-falling.svg"),
 		tr("Trigger on falling edge"), parent);
-	_trigger_falling->setCheckable(true);
-	connect(_trigger_falling, SIGNAL(triggered()),
-		this, SLOT(on_trigger_falling()));
+	trigger_falling_->setCheckable(true);
+	connect(trigger_falling_, SIGNAL(triggered()), this, SLOT(on_trigger()));
 
-	_trigger_low = new QAction(QIcon(":/icons/trigger-low.svg"),
+	trigger_low_ = new QAction(*get_icon(":/icons/trigger-low.svg"),
 		tr("Trigger on low level"), parent);
-	_trigger_low->setCheckable(true);
-	connect(_trigger_low, SIGNAL(triggered()),
-		this, SLOT(on_trigger_low()));
+	trigger_low_->setCheckable(true);
+	connect(trigger_low_, SIGNAL(triggered()), this, SLOT(on_trigger()));
 
-	_trigger_change = new QAction(QIcon(":/icons/trigger-change.svg"),
+	trigger_change_ = new QAction(*get_icon(":/icons/trigger-change.svg"),
 		tr("Trigger on rising or falling edge"), parent);
-	_trigger_change->setCheckable(true);
-	connect(_trigger_change, SIGNAL(triggered()),
-		this, SLOT(on_trigger_change()));
+	trigger_change_->setCheckable(true);
+	connect(trigger_change_, SIGNAL(triggered()), this, SLOT(on_trigger()));
+}
+
+const vector<int32_t> LogicSignal::get_trigger_types() const
+{
+	const auto sr_dev = device_->device();
+	if (sr_dev->config_check(ConfigKey::TRIGGER_MATCH, Capability::LIST)) {
+		const Glib::VariantContainerBase gvar =
+			sr_dev->config_list(ConfigKey::TRIGGER_MATCH);
+		return Glib::VariantBase::cast_dynamic<
+			Glib::Variant<vector<int32_t>>>(gvar).get();
+	} else {
+		return vector<int32_t>();
+	}
+}
+
+QAction* LogicSignal::action_from_trigger_type(const TriggerMatchType *type)
+{
+	QAction *action;
+
+	action = trigger_none_;
+	if (type) {
+		switch (type->id()) {
+		case SR_TRIGGER_ZERO:
+			action = trigger_low_;
+			break;
+		case SR_TRIGGER_ONE:
+			action = trigger_high_;
+			break;
+		case SR_TRIGGER_RISING:
+			action = trigger_rising_;
+			break;
+		case SR_TRIGGER_FALLING:
+			action = trigger_falling_;
+			break;
+		case SR_TRIGGER_EDGE:
+			action = trigger_change_;
+			break;
+		default:
+			assert(0);
+		}
+	}
+
+	return action;
+}
+
+const TriggerMatchType *LogicSignal::trigger_type_from_action(QAction *action)
+{
+	if (action == trigger_low_)
+		return TriggerMatchType::ZERO;
+	else if (action == trigger_high_)
+		return TriggerMatchType::ONE;
+	else if (action == trigger_rising_)
+		return TriggerMatchType::RISING;
+	else if (action == trigger_falling_)
+		return TriggerMatchType::FALLING;
+	else if (action == trigger_change_)
+		return TriggerMatchType::EDGE;
+	else
+		return nullptr;
 }
 
 void LogicSignal::populate_popup_form(QWidget *parent, QFormLayout *form)
 {
-	GVariant *gvar;
-
 	Signal::populate_popup_form(parent, form);
 
-	// Add the trigger actions
-	assert(_dev_inst);
-	if ((gvar = _dev_inst->list_config(NULL, SR_CONF_TRIGGER_TYPE)))
-	{
-		const char *const trig_types =
-			g_variant_get_string(gvar, NULL);
+	const vector<int32_t> trig_types = get_trigger_types();
 
-		if (trig_types && trig_types[0] != '\0')
-		{
-			_trigger_bar = new QToolBar(parent);
+	if (!trig_types.empty()) {
+		trigger_bar_ = new QToolBar(parent);
+		init_trigger_actions(trigger_bar_);
+		trigger_bar_->addAction(trigger_none_);
+		trigger_none_->setChecked(!trigger_match_);
 
-			init_trigger_actions(_trigger_bar);
-			_trigger_bar->addAction(_trigger_none);
-			add_trigger_action(trig_types, 'r', _trigger_rising);
-			add_trigger_action(trig_types, '1', _trigger_high);
-			add_trigger_action(trig_types, 'f', _trigger_falling);
-			add_trigger_action(trig_types, '0', _trigger_low);
-			add_trigger_action(trig_types, 'c', _trigger_change);
-		
-			update_trigger_actions();
-
-			form->addRow(tr("Trigger"), _trigger_bar);
+		for (auto type_id : trig_types) {
+			const TriggerMatchType *const type =
+				TriggerMatchType::get(type_id);
+			QAction *const action = action_from_trigger_type(type);
+			trigger_bar_->addAction(action);
+			action->setChecked(trigger_match_ == type);
 		}
-
-		g_variant_unref(gvar);
+		form->addRow(tr("Trigger"), trigger_bar_);
 	}
 }
 
-void LogicSignal::add_trigger_action(const char *trig_types, char type,
-	QAction *action)
+void LogicSignal::modify_trigger()
 {
-	while(*trig_types)
-		if(*trig_types++ == type) {
-			_trigger_bar->addAction(action);
-			break;
+	auto trigger = session_.session()->trigger();
+	auto new_trigger = session_.device_manager().context()->create_trigger("pulseview");
+
+	if (trigger) {
+		for (auto stage : trigger->stages()) {
+			const auto &matches = stage->matches();
+			if (std::none_of(matches.begin(), matches.end(),
+			    [&](shared_ptr<TriggerMatch> match) {
+					return match->channel() != channel_; }))
+				continue;
+
+			auto new_stage = new_trigger->add_stage();
+			for (auto match : stage->matches()) {
+				if (match->channel() == channel_)
+					continue;
+				new_stage->add_match(match->channel(), match->type());
+			}
 		}
-}
-
-void LogicSignal::update_trigger_actions()
-{
-	const char cur_trigger = _probe->trigger ?
-		_probe->trigger[0] : '\0';
-	_trigger_none->setChecked(cur_trigger == '\0');
-	_trigger_rising->setChecked(cur_trigger == 'r');
-	_trigger_high->setChecked(cur_trigger == '1');
-	_trigger_falling->setChecked(cur_trigger == 'f');
-	_trigger_low->setChecked(cur_trigger == '0');
-	_trigger_change->setChecked(cur_trigger == 'c');
-}
-
-void LogicSignal::set_trigger(char type)
-{
-	const char trigger_type_string[2] = {type, 0};
-	const char *const trigger_string =
-		(type != 0) ? trigger_type_string : NULL;
-
-	assert(_dev_inst);
-	const sr_dev_inst *const sdi = _dev_inst->dev_inst();
-	assert(sdi);
-
-	const int probe_count = g_slist_length(sdi->channels);
-	assert(probe_count > 0);
-
-	assert(_probe && _probe->index < probe_count);
-
-	for (int i = 0; i < probe_count; i++) {
-		sr_dev_trigger_set(sdi, i, (i == _probe->index) ?
-			trigger_string : NULL);
 	}
 
-	update_trigger_actions();
+	if (trigger_match_) {
+		// Until we can let the user decide how to group trigger matches
+		// into stages, put all of the matches into a single stage --
+		// most devices only support a single trigger stage.
+		if (new_trigger->stages().empty())
+			new_trigger->add_stage();
+
+		new_trigger->stages().back()->add_match(channel_, trigger_match_);
+	}
+
+	session_.session()->set_trigger(
+		new_trigger->stages().empty() ? nullptr : new_trigger);
+
+	if (owner_)
+		owner_->row_item_appearance_changed(false, true);
 }
 
-void LogicSignal::on_trigger_none()
+const QIcon* LogicSignal::get_icon(const char *path)
 {
-	set_trigger('\0');	
+	const QIcon *icon = icon_cache_.take(path);
+	if (!icon) {
+		icon = new QIcon(path);
+		icon_cache_.insert(path, icon);
+	}
+
+	return icon;
 }
 
-void LogicSignal::on_trigger_rising()
+const QPixmap* LogicSignal::get_pixmap(const char *path)
 {
-	set_trigger('r');	
+	const QPixmap *pixmap = pixmap_cache_.take(path);
+	if (!pixmap) {
+		pixmap = new QPixmap(path);
+		pixmap_cache_.insert(path, pixmap);
+	}
+
+	return pixmap;
 }
 
-void LogicSignal::on_trigger_high()
+void LogicSignal::on_trigger()
 {
-	set_trigger('1');	
-}
+	QAction *action;
 
-void LogicSignal::on_trigger_falling()
-{
-	set_trigger('f');	
-}
+	action_from_trigger_type(trigger_match_)->setChecked(false);
 
-void LogicSignal::on_trigger_low()
-{
-	set_trigger('0');	
-}
+	action = (QAction *)sender();
+	action->setChecked(true);
+	trigger_match_ = trigger_type_from_action(action);
 
-void LogicSignal::on_trigger_change()
-{
-	set_trigger('c');	
+	modify_trigger();
 }
 
 } // namespace view

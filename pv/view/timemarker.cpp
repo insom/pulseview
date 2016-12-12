@@ -18,56 +18,149 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#include "timemarker.h"
+#include <algorithm>
 
-#include "view.h"
+#include <extdef.h>
 
+#include "timemarker.hpp"
+
+#include "view.hpp"
+#include "pv/widgets/timestampspinbox.hpp"
+
+#include <QApplication>
 #include <QFormLayout>
+#include <QFontMetrics>
 #include <QPainter>
 
-#include <pv/widgets/popup.h>
+#include <pv/widgets/popup.hpp>
+
+using std::max;
+using std::min;
 
 namespace pv {
 namespace view {
 
-TimeMarker::TimeMarker(View &view, const QColor &colour, double time) :
-	_view(view),
-	_colour(colour),
-	_time(time),
-	_value_action(NULL),
-	_value_widget(NULL),
-	_updating_value_widget(false)
+const int TimeMarker::ArrowSize = 4;
+
+TimeMarker::TimeMarker(
+	View &view, const QColor &colour, const pv::util::Timestamp& time) :
+	TimeItem(view),
+	colour_(colour),
+	time_(time),
+	value_action_(nullptr),
+	value_widget_(nullptr),
+	updating_value_widget_(false)
 {
 }
 
-double TimeMarker::time() const
+const pv::util::Timestamp& TimeMarker::time() const
 {
-	return _time;
+	return time_;
+}
+
+void TimeMarker::set_time(const pv::util::Timestamp& time)
+{
+	time_ = time;
+
+	if (value_widget_) {
+		updating_value_widget_ = true;
+		value_widget_->setValue(time);
+		updating_value_widget_ = false;
+	}
+
+	view_.time_item_appearance_changed(true, true);
 }
 
 float TimeMarker::get_x() const
 {
-	return (_time - _view.offset()) / _view.scale();
+	return ((time_ - view_.offset()) / view_.scale()).convert_to<float>();
 }
 
-void TimeMarker::set_time(double time)
+QPoint TimeMarker::point(const QRect &rect) const
 {
-	_time = time;
-
-	if (_value_widget) {
-		_updating_value_widget = true;
-		_value_widget->setValue(time);
-		_updating_value_widget = false;
-	}
-
-	time_changed();
+	return QPoint(get_x(), rect.bottom());
 }
 
-void TimeMarker::paint(QPainter &p, const QRect &rect)
+QRectF TimeMarker::label_rect(const QRectF &rect) const
+{
+	QFontMetrics m(QApplication::font());
+	const QSizeF text_size(
+		max(m.boundingRect(get_text()).size().width(), ArrowSize),
+		m.height());
+	const QSizeF label_size(text_size + LabelPadding * 2);
+	const float top = rect.height() - label_size.height() -
+		TimeMarker::ArrowSize - 0.5f;
+	const float x = get_x();
+
+	return QRectF(QPointF(x - label_size.width() / 2, top), label_size);
+}
+
+QRectF TimeMarker::hit_box_rect(const ViewItemPaintParams &pp) const
 {
 	const float x = get_x();
-	p.setPen(_colour);
-	p.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()));
+	const float h = QFontMetrics(QApplication::font()).height();
+	return QRectF(x - h / 2.0f, pp.top(), h, pp.height());
+}
+
+void TimeMarker::paint_label(QPainter &p, const QRect &rect, bool hover)
+{
+	if (!enabled())
+		return;
+
+	const qreal x = ((time_ - view_.offset()) / view_.scale()).convert_to<qreal>();
+	const QRectF r(label_rect(rect));
+
+	const QPointF points[] = {
+		r.topLeft(),
+		r.bottomLeft(),
+		QPointF(max(r.left(), x - ArrowSize), r.bottom()),
+		QPointF(x, rect.bottom()),
+		QPointF(min(r.right(), x + ArrowSize), r.bottom()),
+		r.bottomRight(),
+		r.topRight()
+	};
+
+	const QPointF highlight_points[] = {
+		QPointF(r.left() + 1, r.top() + 1),
+		QPointF(r.left() + 1, r.bottom() - 1),
+		QPointF(max(r.left() + 1, x - ArrowSize), r.bottom() - 1),
+		QPointF(min(max(r.left() + 1, x), r.right() - 1),
+			rect.bottom() - 1),
+		QPointF(min(r.right() - 1, x + ArrowSize), r.bottom() - 1),
+		QPointF(r.right() - 1, r.bottom() - 1),
+		QPointF(r.right() - 1, r.top() + 1),
+	};
+
+	if (selected()) {
+		p.setPen(highlight_pen());
+		p.setBrush(Qt::transparent);
+		p.drawPolygon(points, countof(points));
+	}
+
+	p.setPen(Qt::transparent);
+	p.setBrush(hover ? colour_.lighter() : colour_);
+	p.drawPolygon(points, countof(points));
+
+	p.setPen(colour_.lighter());
+	p.setBrush(Qt::transparent);
+	p.drawPolygon(highlight_points, countof(highlight_points));
+
+	p.setPen(colour_.darker());
+	p.setBrush(Qt::transparent);
+	p.drawPolygon(points, countof(points));
+
+	p.setPen(select_text_colour(colour_));
+	p.drawText(r, Qt::AlignCenter | Qt::AlignVCenter, get_text());
+}
+
+void TimeMarker::paint_fore(QPainter &p, const ViewItemPaintParams &pp)
+{
+	if (!enabled())
+		return;
+
+	const float x = get_x();
+	p.setPen(colour_.darker());
+	p.drawLine(QPointF(x, pp.top()), QPointF(x, pp.bottom()));
 }
 
 pv::widgets::Popup* TimeMarker::create_popup(QWidget *parent)
@@ -75,29 +168,27 @@ pv::widgets::Popup* TimeMarker::create_popup(QWidget *parent)
 	using pv::widgets::Popup;
 
 	Popup *const popup = new Popup(parent);
+	popup->set_position(parent->mapToGlobal(
+		point(parent->rect())), Popup::Bottom);
+
 	QFormLayout *const form = new QFormLayout(popup);
 	popup->setLayout(form);
 
-	_value_widget = new QDoubleSpinBox(parent);
-	_value_widget->setDecimals(9);
-	_value_widget->setSuffix("s");
-	_value_widget->setSingleStep(1e-6);
-	_value_widget->setValue(_time);
+	value_widget_ = new pv::widgets::TimestampSpinBox(parent);
+	value_widget_->setValue(time_);
 
-	connect(_value_widget, SIGNAL(valueChanged(double)),
-		this, SLOT(on_value_changed(double)));
+	connect(value_widget_, SIGNAL(valueChanged(const pv::util::Timestamp&)),
+		this, SLOT(on_value_changed(const pv::util::Timestamp&)));
 
-	form->addRow(tr("Time"), _value_widget);
+	form->addRow(tr("Time"), value_widget_);
 
 	return popup;
 }
 
-void TimeMarker::on_value_changed(double value)
+void TimeMarker::on_value_changed(const pv::util::Timestamp& value)
 {
-	if (!_updating_value_widget) {
-		_time = value;
-		time_changed();
-	}
+	if (!updating_value_widget_)
+		set_time(value);
 }
 
 } // namespace view

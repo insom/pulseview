@@ -21,18 +21,19 @@
 #include <extdef.h>
 
 #include <assert.h>
-#include <math.h>
+#include <cmath>
 
 #include <QApplication>
 #include <QFormLayout>
+#include <QKeyEvent>
 #include <QLineEdit>
 
-#include "trace.h"
-#include "tracepalette.h"
-#include "view.h"
+#include "trace.hpp"
+#include "tracepalette.hpp"
+#include "view.hpp"
 
-#include <pv/widgets/colourbutton.h>
-#include <pv/widgets/popup.h>
+#include <pv/widgets/colourbutton.hpp>
+#include <pv/widgets/popup.hpp>
 
 namespace pv {
 namespace view {
@@ -40,100 +41,71 @@ namespace view {
 const QPen Trace::AxisPen(QColor(128, 128, 128, 64));
 const int Trace::LabelHitPadding = 2;
 
+const QColor Trace::DarkBGColour(235, 235, 235);    // Quite light grey
+const QColor Trace::BrightBGColour(245, 245, 245);  // Very light grey
+
 Trace::Trace(QString name) :
-	_name(name),
-	_v_offset(0),
-	_popup(NULL),
-	_popup_form(NULL)
+	name_(name),
+	coloured_bg_(true), // Default setting is set in MainWindow::setup_ui()
+	popup_(nullptr),
+	popup_form_(nullptr)
 {
 }
 
-QString Trace::get_name() const
+QString Trace::name() const
 {
-	return _name;
+	return name_;
 }
 
 void Trace::set_name(QString name)
 {
-	_name = name;
+	name_ = name;
 }
 
-QColor Trace::get_colour() const
+QColor Trace::colour() const
 {
-	return _colour;
+	return colour_;
 }
 
 void Trace::set_colour(QColor colour)
 {
-	_colour = colour;
+	colour_ = colour;
+
+	bgcolour_ = colour;
+	bgcolour_.setAlpha(20);
 }
 
-int Trace::get_v_offset() const
+void Trace::set_coloured_bg(bool state)
 {
-	return _v_offset;
+	coloured_bg_ = state;
 }
 
-void Trace::set_v_offset(int v_offset)
+void Trace::paint_label(QPainter &p, const QRect &rect, bool hover)
 {
-	_v_offset = v_offset;
-}
+	const int y = get_visual_y();
 
-void Trace::set_view(pv::view::View *view)
-{
-	assert(view);
-	_view = view;
-}
-
-void Trace::paint_back(QPainter &p, int left, int right)
-{
-	(void)p;
-	(void)left;
-	(void)right;
-}
-
-void Trace::paint_mid(QPainter &p, int left, int right)
-{
-	(void)p;
-	(void)left;
-	(void)right;
-}
-
-void Trace::paint_fore(QPainter &p, int left, int right)
-{
-	(void)p;
-	(void)left;
-	(void)right;
-}
-
-void Trace::paint_label(QPainter &p, int right, bool hover)
-{
-	assert(_view);
-	const int y = _v_offset - _view->v_offset();
-
-	p.setBrush(_colour);
+	p.setBrush(colour_);
 
 	if (!enabled())
 		return;
 
-	const QColor colour = get_colour();
-
-	const QRectF label_rect = get_label_rect(right);
+	const QRectF r = label_rect(rect);
 
 	// Paint the label
+	const float label_arrow_length = r.height() / 2;
 	const QPointF points[] = {
-		label_rect.topLeft(),
-		label_rect.topRight(),
-		QPointF(right, y),
-		label_rect.bottomRight(),
-		label_rect.bottomLeft()
+		r.topLeft(),
+		QPointF(r.right() - label_arrow_length, r.top()),
+		QPointF(r.right(), y),
+		QPointF(r.right() - label_arrow_length, r.bottom()),
+		r.bottomLeft()
 	};
-
 	const QPointF highlight_points[] = {
-		QPointF(label_rect.left() + 1, label_rect.top() + 1),
-		QPointF(label_rect.right(), label_rect.top() + 1),
-		QPointF(right - 1, y),
-		QPointF(label_rect.right(), label_rect.bottom() - 1),
-		QPointF(label_rect.left() + 1, label_rect.bottom() - 1)
+		QPointF(r.left() + 1, r.top() + 1),
+		QPointF(r.right() - label_arrow_length, r.top() + 1),
+		QPointF(r.right() - 1, y),
+		QPointF(r.right() - label_arrow_length, r.bottom() - 1),
+		QPointF(r.left() + 1, r.bottom() - 1)
 	};
 
 	if (selected()) {
@@ -143,38 +115,28 @@ void Trace::paint_label(QPainter &p, int right, bool hover)
 	}
 
 	p.setPen(Qt::transparent);
-	p.setBrush(hover ? colour.lighter() : colour);
+	p.setBrush(hover ? colour_.lighter() : colour_);
 	p.drawPolygon(points, countof(points));
 
-	p.setPen(colour.lighter());
+	p.setPen(colour_.lighter());
 	p.setBrush(Qt::transparent);
 	p.drawPolygon(highlight_points, countof(highlight_points));
 
-	p.setPen(colour.darker());
+	p.setPen(colour_.darker());
 	p.setBrush(Qt::transparent);
 	p.drawPolygon(points, countof(points));
 
 	// Paint the text
-	p.setPen(get_text_colour());
+	p.setPen(select_text_colour(colour_));
 	p.setFont(QApplication::font());
-	p.drawText(label_rect, Qt::AlignCenter | Qt::AlignVCenter, _name);
-}
-
-bool Trace::pt_in_label_rect(int left, int right, const QPoint &point)
-{
-	(void)left;
-
-	const QRectF label = get_label_rect(right);
-	return enabled() && QRectF(
-		QPointF(label.left() - LabelHitPadding,
-			label.top() - LabelHitPadding),
-		QPointF(right, label.bottom() + LabelHitPadding)
-			).contains(point);
+	p.drawText(QRectF(r.x(), r.y(),
+		r.width() - label_arrow_length, r.height()),
+		Qt::AlignCenter | Qt::AlignVCenter, name_);
 }
 
 QMenu* Trace::create_context_menu(QWidget *parent)
 {
-	QMenu *const menu = SelectableItem::create_context_menu(parent);
+	QMenu *const menu = ViewItem::create_context_menu(parent);
 
 	return menu;
 }
@@ -183,50 +145,59 @@ pv::widgets::Popup* Trace::create_popup(QWidget *parent)
 {
 	using pv::widgets::Popup;
 
-	_popup = new Popup(parent);
+	popup_ = new Popup(parent);
+	popup_->set_position(parent->mapToGlobal(
+		point(parent->rect())), Popup::Right);
 
 	create_popup_form();
 
-	connect(_popup, SIGNAL(closed()),
+	connect(popup_, SIGNAL(closed()),
 		this, SLOT(on_popup_closed()));
 
-	return _popup;
+	return popup_;
 }
 
-int Trace::get_y() const
-{
-	return _v_offset - _view->v_offset();
-}
-
-QRectF Trace::get_label_rect(int right)
+QRectF Trace::label_rect(const QRectF &rect) const
 {
 	using pv::view::View;
 
-	assert(_view);
-
 	QFontMetrics m(QApplication::font());
 	const QSize text_size(
-		m.boundingRect(QRect(), 0, _name).width(),
-		m.boundingRect(QRect(), 0, "Tg").height());
+		m.boundingRect(QRect(), 0, name_).width(), m.height());
 	const QSizeF label_size(
-		text_size.width() + View::LabelPadding.width() * 2,
-		ceilf((text_size.height() + View::LabelPadding.height() * 2) / 2) * 2);
-	const float label_arrow_length = label_size.height() / 2;
+		text_size.width() + LabelPadding.width() * 2,
+		ceilf((text_size.height() + LabelPadding.height() * 2) / 2) * 2);
+	const float half_height = label_size.height() / 2;
 	return QRectF(
-		right - label_arrow_length - label_size.width() - 0.5,
-		get_y() + 0.5f - label_size.height() / 2,
-		label_size.width(), label_size.height());
+		rect.right() - half_height - label_size.width() - 0.5,
+		get_visual_y() + 0.5f - half_height,
+		label_size.width() + half_height,
+		label_size.height());
 }
 
-QColor Trace::get_text_colour() const
+void Trace::paint_back(QPainter &p, const ViewItemPaintParams &pp)
 {
-	return (_colour.lightness() > 64) ? Qt::black : Qt::white;
+	if (coloured_bg_)
+		p.setBrush(bgcolour_);
+	else
+		p.setBrush(bgcolour_state_ ? BrightBGColour : DarkBGColour);
+
+	p.setPen(QPen(Qt::NoPen));
+
+	const std::pair<int, int> extents = v_extents();
+
+	const int x = 0;
+	const int y = get_visual_y() + extents.first;
+	const int w = pp.right() - pp.left();
+	const int h = extents.second - extents.first;
+
+	p.drawRect(x, y, w, h);
 }
 
-void Trace::paint_axis(QPainter &p, int y, int left, int right)
+void Trace::paint_axis(QPainter &p, const ViewItemPaintParams &pp, int y)
 {
 	p.setPen(AxisPen);
-	p.drawLine(QPointF(left, y + 0.5f), QPointF(right, y + 0.5f));
+	p.drawLine(QPointF(pp.left(), y + 0.5f), QPointF(pp.right(), y + 0.5f));
 }
 
 void Trace::add_colour_option(QWidget *parent, QFormLayout *form)
@@ -236,7 +207,7 @@ void Trace::add_colour_option(QWidget *parent, QFormLayout *form)
 	ColourButton *const colour_button = new ColourButton(
 		TracePalette::Rows, TracePalette::Cols, parent);
 	colour_button->set_palette(TracePalette::Colours);
-	colour_button->set_colour(_colour);
+	colour_button->set_colour(colour_);
 	connect(colour_button, SIGNAL(selected(const QColor&)),
 		this, SLOT(on_colour_changed(const QColor&)));
 
@@ -250,19 +221,19 @@ void Trace::create_popup_form()
 	// Transfer the layout and the child widgets to a temporary widget
 	// which then goes out of scope destroying the layout and all the child
 	// widgets.
-	if (_popup_form)
-		QWidget().setLayout(_popup_form);
+	if (popup_form_)
+		QWidget().setLayout(popup_form_);
 
 	// Repopulate the popup
-	_popup_form = new QFormLayout(_popup);
-	_popup->setLayout(_popup_form);
-	populate_popup_form(_popup, _popup_form);
+	popup_form_ = new QFormLayout(popup_);
+	popup_->setLayout(popup_form_);
+	populate_popup_form(popup_, popup_form_);
 }
 
 void Trace::populate_popup_form(QWidget *parent, QFormLayout *form)
 {
 	QLineEdit *const name_edit = new QLineEdit(parent);
-	name_edit->setText(_name);
+	name_edit->setText(name_);
 	connect(name_edit, SIGNAL(textChanged(const QString&)),
 		this, SLOT(on_text_changed(const QString&)));
 	form->addRow(tr("Name"), name_edit);
@@ -272,20 +243,24 @@ void Trace::populate_popup_form(QWidget *parent, QFormLayout *form)
 
 void Trace::on_popup_closed()
 {
-	_popup = NULL;
-	_popup_form = NULL;
+	popup_ = nullptr;
+	popup_form_ = nullptr;
 }
 
 void Trace::on_text_changed(const QString &text)
 {
 	set_name(text);
-	text_changed();
+
+	if (owner_)
+		owner_->extents_changed(true, false);
 }
 
 void Trace::on_colour_changed(const QColor &colour)
 {
 	set_colour(colour);
-	colour_changed();
+
+	if (owner_)
+		owner_->row_item_appearance_changed(true, true);
 }
 
 } // namespace view

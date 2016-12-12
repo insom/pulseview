@@ -18,15 +18,16 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#include "header.h"
-#include "view.h"
+#include "header.hpp"
+#include "view.hpp"
 
-#include "signal.h"
-#include "../sigsession.h"
+#include "signal.hpp"
+#include "tracegroup.hpp"
 
-#include <assert.h>
+#include <cassert>
+#include <algorithm>
 
-#include <boost/foreach.hpp>
+#include <boost/iterator/filter_iterator.hpp>
 
 #include <QApplication>
 #include <QMenu>
@@ -34,270 +35,187 @@
 #include <QPainter>
 #include <QRect>
 
-#include <pv/widgets/popup.h>
+#include <pv/session.hpp>
+#include <pv/widgets/popup.hpp>
 
-using boost::shared_ptr;
+using boost::make_filter_iterator;
+using std::dynamic_pointer_cast;
 using std::max;
 using std::make_pair;
+using std::min;
 using std::pair;
+using std::shared_ptr;
+using std::stable_sort;
 using std::vector;
 
 namespace pv {
 namespace view {
 
 const int Header::Padding = 12;
+const int Header::BaselineOffset = 5;
+
+static bool item_selected(shared_ptr<TraceTreeItem> r)
+{
+	return r->selected();
+}
 
 Header::Header(View &parent) :
-	MarginWidget(parent),
-	_dragging(false)
+	MarginWidget(parent)
 {
-	setFocusPolicy(Qt::ClickFocus);
-	setMouseTracking(true);
-
-	connect(&_view.session(), SIGNAL(signals_changed()),
-		this, SLOT(on_signals_changed()));
-
-	connect(&_view, SIGNAL(signals_moved()),
-		this, SLOT(on_signals_moved()));
-
-	// Trigger the initial event manually. The default device has signals
-	// which were created before this object came into being
-	on_signals_changed();
 }
 
 QSize Header::sizeHint() const
 {
-	int max_width = 0;
-
-	const vector< shared_ptr<Trace> > traces(_view.get_traces());
-	BOOST_FOREACH(shared_ptr<Trace> t, traces) {
-		assert(t);
-		max_width = max(max_width, (int)t->get_label_rect(0).width());
-	}
-
-	return QSize(max_width + Padding, 0);
+	QRectF max_rect(-Padding, 0, Padding, 0);
+	const vector<shared_ptr<TraceTreeItem>> items(
+		view_.list_by_type<TraceTreeItem>());
+	for (auto &i : items)
+		if (i->enabled())
+			max_rect = max_rect.united(i->label_rect(QRect()));
+	return QSize(max_rect.width() + Padding + BaselineOffset, 0);
 }
 
-shared_ptr<Trace> Header::get_mouse_over_trace(const QPoint &pt)
+QSize Header::extended_size_hint() const
 {
-	const int w = width();
-	const vector< shared_ptr<Trace> > traces(_view.get_traces());
-
-	BOOST_FOREACH(const shared_ptr<Trace> t, traces)
-	{
-		assert(t);
-		if (t->pt_in_label_rect(0, w, pt))
-			return t;
-	}
-
-	return shared_ptr<Trace>();
+	return sizeHint() + QSize(ViewItem::HighlightRadius, 0);
 }
 
-void Header::clear_selection()
+vector< shared_ptr<ViewItem> > Header::items()
 {
-	const vector< shared_ptr<Trace> > traces(_view.get_traces());
-	BOOST_FOREACH(const shared_ptr<Trace> t, traces) {
-		assert(t);
-		t->select(false);
-	}
+	const vector<shared_ptr<TraceTreeItem>> items(
+		view_.list_by_type<TraceTreeItem>());
+	return vector< shared_ptr<ViewItem> >(items.begin(), items.end());
+}
 
-	update();
+shared_ptr<ViewItem> Header::get_mouse_over_item(const QPoint &pt)
+{
+	const QRect r(0, 0, width() - BaselineOffset, height());
+	const vector<shared_ptr<TraceTreeItem>> items(
+		view_.list_by_type<TraceTreeItem>());
+	for (auto i = items.rbegin(); i != items.rend(); i++)
+		if ((*i)->enabled() && (*i)->label_rect(r).contains(pt))
+			return *i;
+	return shared_ptr<TraceTreeItem>();
 }
 
 void Header::paintEvent(QPaintEvent*)
 {
-	const int w = width();
-	const vector< shared_ptr<Trace> > traces(_view.get_traces());
+	// The trace labels are not drawn with the arrows exactly on the
+	// left edge of the widget, because then the selection shadow
+	// would be clipped away.
+	const QRect rect(0, 0, width() - BaselineOffset, height());
+
+	vector< shared_ptr<RowItem> > items(
+		view_.list_by_type<RowItem>());
+
+	stable_sort(items.begin(), items.end(),
+		[](const shared_ptr<RowItem> &a, const shared_ptr<RowItem> &b) {
+			return a->point(QRect()).y() < b->point(QRect()).y(); });
 
 	QPainter painter(this);
 	painter.setRenderHint(QPainter::Antialiasing);
 
-	const bool dragging = !_drag_traces.empty();
-	BOOST_FOREACH(const shared_ptr<Trace> t, traces)
-	{
-		assert(t);
+	for (const shared_ptr<RowItem> r : items) {
+		assert(r);
 
-		const bool highlight = !dragging && t->pt_in_label_rect(
-			0, w, _mouse_point);
-		t->paint_label(painter, w, highlight);
+		const bool highlight = !item_dragging_ &&
+			r->label_rect(rect).contains(mouse_point_);
+		r->paint_label(painter, rect, highlight);
 	}
 
 	painter.end();
 }
 
-void Header::mousePressEvent(QMouseEvent *event)
-{
-	assert(event);
-
-	const vector< shared_ptr<Trace> > traces(_view.get_traces());
-
-	if (event->button() & Qt::LeftButton) {
-		_mouse_down_point = event->pos();
-
-		// Save the offsets of any signals which will be dragged
-		BOOST_FOREACH(const shared_ptr<Trace> t, traces)
-			if (t->selected())
-				_drag_traces.push_back(
-					make_pair(t, t->get_v_offset()));
-	}
-
-	// Select the signal if it has been clicked
-	const shared_ptr<Trace> mouse_over_trace =
-		get_mouse_over_trace(event->pos());
-	if (mouse_over_trace) {
-		if (mouse_over_trace->selected())
-			mouse_over_trace->select(false);
-		else {
-			mouse_over_trace->select(true);
-
-			if (~QApplication::keyboardModifiers() &
-				Qt::ControlModifier)
-				_drag_traces.clear();
-
-			// Add the signal to the drag list
-			if (event->button() & Qt::LeftButton)
-				_drag_traces.push_back(
-					make_pair(mouse_over_trace,
-					mouse_over_trace->get_v_offset()));
-		}
-	}
-
-	if (~QApplication::keyboardModifiers() & Qt::ControlModifier) {
-		// Unselect all other signals because the Ctrl is not
-		// pressed
-		BOOST_FOREACH(const shared_ptr<Trace> t, traces)
-			if (t != mouse_over_trace)
-				t->select(false);
-	}
-
-	selection_changed();
-	update();
-}
-
-void Header::mouseReleaseEvent(QMouseEvent *event)
-{
-	using pv::widgets::Popup;
-
-	assert(event);
-	if (event->button() == Qt::LeftButton) {
-		if (_dragging)
-			_view.normalize_layout();
-		else
-		{
-			const shared_ptr<Trace> mouse_over_trace =
-				get_mouse_over_trace(event->pos());
-			if (mouse_over_trace) {
-				Popup *const p =
-					mouse_over_trace->create_popup(&_view);
-				p->set_position(mapToGlobal(QPoint(width(),
-					mouse_over_trace->get_y())),
-					Popup::Right);
-				p->show();
-			}
-		}
-
-		_dragging = false;
-		_drag_traces.clear();
-	}
-}
-
-void Header::mouseMoveEvent(QMouseEvent *event)
-{
-	assert(event);
-	_mouse_point = event->pos();
-
-	if (!(event->buttons() & Qt::LeftButton))
-		return;
-
-	if ((event->pos() - _mouse_down_point).manhattanLength() <
-		QApplication::startDragDistance())
-		return;
-
-	// Move the signals if we are dragging
-	if (!_drag_traces.empty())
-	{
-		_dragging = true;
-
-		const int delta = event->pos().y() - _mouse_down_point.y();
-
-		for (std::list<std::pair<boost::weak_ptr<Trace>,
-			int> >::iterator i = _drag_traces.begin();
-			i != _drag_traces.end(); i++) {
-			const boost::shared_ptr<Trace> trace((*i).first);
-			if (trace) {
-				const int y = (*i).second + delta;
-				const int y_snap =
-					((y + View::SignalSnapGridSize / 2) /
-						View::SignalSnapGridSize) *
-						View::SignalSnapGridSize;
-				trace->set_v_offset(y_snap);
-
-				// Ensure the trace is selected
-				trace->select();
-			}
-			
-		}
-
-		signals_moved();
-	}
-
-	update();
-}
-
-void Header::leaveEvent(QEvent*)
-{
-	_mouse_point = QPoint(-1, -1);
-	update();
-}
-
 void Header::contextMenuEvent(QContextMenuEvent *event)
 {
-	const shared_ptr<Trace> t = get_mouse_over_trace(_mouse_point);
+	const shared_ptr<ViewItem> r = get_mouse_over_item(mouse_point_);
+	if (!r)
+		return;
 
-	if (t)
-		t->create_context_menu(this)->exec(event->globalPos());
+	QMenu *menu = r->create_context_menu(this);
+	if (!menu)
+		menu = new QMenu(this);
+
+	const vector< shared_ptr<TraceTreeItem> > items(
+		view_.list_by_type<TraceTreeItem>());
+	if (std::count_if(items.begin(), items.end(), item_selected) > 1)
+	{
+		menu->addSeparator();
+
+		QAction *const group = new QAction(tr("Group"), this);
+		QList<QKeySequence> shortcuts;
+		shortcuts.append(QKeySequence(Qt::ControlModifier | Qt::Key_G));
+		group->setShortcuts(shortcuts);
+		connect(group, SIGNAL(triggered()), this, SLOT(on_group()));
+		menu->addAction(group);
+	}
+
+	menu->exec(event->globalPos());
 }
 
 void Header::keyPressEvent(QKeyEvent *e)
 {
 	assert(e);
 
-	switch (e->key())
-	{
-	case Qt::Key_Delete:
-	{
-		const vector< shared_ptr<Trace> > traces(_view.get_traces());
-		BOOST_FOREACH(const shared_ptr<Trace> t, traces)
-			if (t->selected())
-				t->delete_pressed();	
-		break;
-	}
+	MarginWidget::keyPressEvent(e);
+
+	if (e->key() == Qt::Key_G && e->modifiers() == Qt::ControlModifier)
+		on_group();
+	else if (e->key() == Qt::Key_U && e->modifiers() == Qt::ControlModifier)
+		on_ungroup();
+}
+
+void Header::on_group()
+{
+	const vector< shared_ptr<TraceTreeItem> > items(
+		view_.list_by_type<TraceTreeItem>());
+	vector< shared_ptr<TraceTreeItem> > selected_items(
+		make_filter_iterator(item_selected, items.begin(), items.end()),
+		make_filter_iterator(item_selected, items.end(), items.end()));
+	stable_sort(selected_items.begin(), selected_items.end(),
+		[](const shared_ptr<TraceTreeItem> &a, const shared_ptr<TraceTreeItem> &b) {
+			return a->visual_v_offset() < b->visual_v_offset(); });
+
+	shared_ptr<TraceGroup> group(new TraceGroup());
+	shared_ptr<TraceTreeItem> mouse_down_item(
+		std::dynamic_pointer_cast<TraceTreeItem>(mouse_down_item_));
+	shared_ptr<TraceTreeItem> focus_item(
+		mouse_down_item ? mouse_down_item : selected_items.front());
+
+	assert(focus_item);
+	assert(focus_item->owner());
+	focus_item->owner()->add_child_item(group);
+
+	// Set the group v_offset here before reparenting
+	group->force_to_v_offset(focus_item->layout_v_offset() +
+		focus_item->v_extents().first);
+
+	for (size_t i = 0; i < selected_items.size(); i++) {
+		const shared_ptr<TraceTreeItem> &r = selected_items[i];
+		assert(r->owner());
+		r->owner()->remove_child_item(r);
+		group->add_child_item(r);
+
+		// Put the items at 1-pixel offsets, so that restack will
+		// stack them in the right order
+		r->set_layout_v_offset(i);
 	}
 }
 
-void Header::on_signals_changed()
+void Header::on_ungroup()
 {
-	const vector< shared_ptr<Trace> > traces(_view.get_traces());
-	BOOST_FOREACH(shared_ptr<Trace> t, traces) {
-		assert(t);
-		connect(t.get(), SIGNAL(visibility_changed()),
-			this, SLOT(update()));
-		connect(t.get(), SIGNAL(text_changed()),
-			this, SLOT(on_trace_text_changed()));
-		connect(t.get(), SIGNAL(colour_changed()),
-			this, SLOT(update()));
-	}
-}
-
-void Header::on_signals_moved()
-{
-	update();
-}
-
-void Header::on_trace_text_changed()
-{
-	update();
-	geometry_updated();
+	bool restart;
+	do {
+		restart = false;
+		const vector< shared_ptr<TraceGroup> > groups(
+			view_.list_by_type<TraceGroup>());
+		for (const shared_ptr<TraceGroup> tg : groups)
+			if (tg->selected()) {
+				tg->ungroup();
+				restart = true;
+				break;
+			}
+	} while (restart);
 }
 
 } // namespace view
