@@ -1,3 +1,14 @@
+pulseview (0.3.0-2) unstable; urgency=medium
+
+  * Grab maintainership to avoid NMU warning
+  * Update control borrowing heavily from Daniel Elstner's PPA
+  * Ubuntu to Debian package name issue
+  * Add qtbase5-dev dependency
+  * Disable -Werror because of shifting a signed number upstream
+  * Change to gnu++11 C++ standard
+
+ -- Aaron Brady <aaron@debian9.insom.me.uk>  Sun, 19 Feb 2017 20:12:31 -0500
+
 pulseview (0.3.0-1) unstable; urgency=medium
 
   * New upstream release.
